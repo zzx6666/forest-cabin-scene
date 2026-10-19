@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#101c1b" />
+    <meta
+      name="description"
+      content="一座藏在四季森林里的童话木屋，可环绕观赏春之花丛、夏夜萤火、秋日金林、冬季温泉与完整室内场景。"
+    />
+    <title>林间 · 四季 | 森林小屋</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <main id="app" aria-label="森林小屋三维场景">
+      <canvas id="scene-canvas" aria-label="可拖动环视的森林木屋三维场景"></canvas>
+
+      <div class="lens-overlay" aria-hidden="true"></div>
+      <div class="edge-shade" aria-hidden="true"></div>
+
+      <section class="interface" aria-label="场景信息与操作">
+        <header class="brand-panel">
+          <div class="eyebrow">
+            <span class="eyebrow-line"></span>
+            <span>FOREST RETREAT&nbsp;&nbsp;/&nbsp;&nbsp;01</span>
+          </div>
+          <h1>林间<span class="title-dot">·</span>四季</h1>
+          <p id="scene-subtitle">松风穿过木屋，灯光刚好亮起。</p>
+        </header>
+
+        <div class="scene-actions" aria-label="场景控制">
+          <button id="tour-toggle" class="scene-button" type="button" aria-label="暂停自动巡展" aria-keyshortcuts="Space" title="空格键也可暂停或继续巡展">
+            <span class="button-icon" aria-hidden="true">
+              <svg class="icon-tour-pause" viewBox="0 0 24 24" fill="none">
+                <path d="M8.2 5.5v13M15.8 5.5v13" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+              <svg class="icon-tour-play" viewBox="0 0 24 24" fill="none">
+                <path d="m8.5 5.7 9.2 6.3-9.2 6.3V5.7Z" stroke="currentColor" stroke-width="1.45" stroke-linejoin="round"/>
+              </svg>
+            </span>
+            <span id="tour-label" class="button-label">暂停巡展</span>
+          </button>
+
+          <button id="sound-toggle" class="scene-button" type="button" aria-pressed="false" aria-label="开启环境音乐">
+            <span class="button-icon" aria-hidden="true">
+              <svg class="icon-sound-off" viewBox="0 0 24 24" fill="none">
+                <path d="M4 9.2v5.6h3.4l4.5 3.7V5.5L7.4 9.2H4Z" stroke="currentColor" stroke-width="1.45" stroke-linejoin="round"/>
+                <path d="m16.3 9.7 4 4.6m0-4.6-4 4.6" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"/>
+              </svg>
+              <svg class="icon-sound-on" viewBox="0 0 24 24" fill="none">
+                <path d="M4 9.2v5.6h3.4l4.5 3.7V5.5L7.4 9.2H4Z" stroke="currentColor" stroke-width="1.45" stroke-linejoin="round"/>
+                <path d="M15.4 9.1a4 4 0 0 1 0 5.8m2.3-8.1a7.2 7.2 0 0 1 0 10.4" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"/>
+              </svg>
+            </span>
+            <span class="button-label">环境音乐</span>
+          </button>
+
+          <button id="view-toggle" class="scene-button" type="button" aria-label="进入室内">
+            <span class="button-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none">
+                <path d="M4.3 11.3 12 4.2l7.7 7.1v8.4H4.3v-8.4Z" stroke="currentColor" stroke-width="1.45" stroke-linejoin="round"/>
+                <path d="M9.2 19.7v-5.1h5.6v5.1M9 9.9h6" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"/>
+              </svg>
+            </span>
+            <span id="view-label" class="button-label">进入室内</span>
+          </button>
+
+          <button id="reset-view" class="scene-button icon-only" type="button" aria-label="回到初始视角">
+            <span class="button-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none">
+                <path d="M5.2 8.5A7.6 7.6 0 1 1 5 13" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"/>
+                <path d="M5.1 4.8v4h4" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </span>
+          </button>
+        </div>
+
+        <div id="tour-timer" class="tour-timer" aria-label="当前季节巡展时间">
+          <div class="tour-timer-head">
+            <span id="tour-state-label">自动巡展</span>
+            <span id="tour-time">00:00 / 00:30</span>
+          </div>
+          <div
+            id="tour-track"
+            class="tour-track"
+            role="progressbar"
+            aria-label="当前季节巡展进度"
+            aria-valuemin="0"
+            aria-valuemax="30"
+            aria-valuenow="0"
+          >
+            <span id="tour-progress" class="tour-progress"></span>
+          </div>
+        </div>
+
+        <footer class="scene-footer">
+          <div class="hint tour-camera-hint">
+            <span class="hint-key">拖动</span>
+            <span id="orbit-hint">360° 环视</span>
+            <i></i>
+            <span class="hint-key">滚轮</span>
+            <span>远近</span>
+            <i></i>
+            <span class="hint-key">双击</span>
+            <span>归位</span>
+          </div>
+          <div class="hint free-camera-hint" aria-hidden="true">
+            <span class="keycap">W</span><span class="keycap">A</span><span class="keycap">S</span><span class="keycap">D</span>
+            <span>移动</span>
+            <i></i>
+            <span class="hint-key">拖动</span>
+            <span>观察</span>
+            <i></i>
+            <span class="hint-key">滚轮</span>
+            <span>缩放</span>
+            <i></i>
+            <span class="hint-key">空格</span>
+            <span>继续巡展</span>
+          </div>
+          <div class="coordinates" aria-hidden="true">
+            <span>31°14′ N</span>
+            <span class="coordinate-divider"></span>
+            <span id="season-caption">四季林区 · 秋 18:42</span>
+          </div>
+        </footer>
+
+        <nav class="season-switcher" id="season-switcher" aria-label="切换四季场景">
+          <button type="button" data-season="spring" aria-pressed="true">
+            <span class="season-main">春</span><span class="season-sub">花醒</span>
+          </button>
+          <button type="button" data-season="summer" aria-pressed="false">
+            <span class="season-main">夏</span><span class="season-sub">蛙鸣</span>
+          </button>
+          <button type="button" data-season="autumn" aria-pressed="false">
+            <span class="season-main">秋</span><span class="season-sub">金林</span>
+          </button>
+          <button type="button" data-season="winter" aria-pressed="false">
+            <span class="season-main">冬</span><span class="season-sub">温泉</span>
+          </button>
+        </nav>
+      </section>
+
+      <div id="scene-transition" class="scene-transition" aria-hidden="true"></div>
+
+      <div id="loading-screen" class="loading-screen" role="status" aria-live="polite">
+        <div class="loading-glow" aria-hidden="true"></div>
+        <div class="loading-content">
+          <div class="loading-mark" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </div>
+          <p class="loading-kicker">A QUIET PLACE BEYOND THE PINES</p>
+          <h2>正在拨亮林间灯火</h2>
+          <div class="loading-track" aria-hidden="true"><span id="loading-bar"></span></div>
+          <p id="loading-copy" class="loading-copy">布置四季与林间灯火…</p>
+        </div>
+      </div>
+
+      <div id="error-card" class="error-card" role="alert" hidden>
+        <span>场景未能载入</span>
+        <p id="error-copy">请确认浏览器已开启 WebGL 后刷新页面。</p>
+      </div>
+    </main>
+
+    <noscript>
+      <div class="noscript">这个场景需要启用 JavaScript 才能浏览。</div>
+    </noscript>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
