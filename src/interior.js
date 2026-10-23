@@ -1,6 +1,8 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { mulberry32, randomRange } from './utils.js';
+import { optimizeStaticScene } from './scene-optimization.js';
+import { resizeShadow } from './performance.js';
 
 // 阁楼床的垂直基准统一维护，避免床架、床垫、床品和护栏出现错层。
 const LOFT_BED = Object.freeze({
@@ -1501,7 +1503,9 @@ export function createInterior(textures, canvas) {
 
   const fireplace = createFireplace(materials, textures);
   scene.add(fireplace.group);
-  scene.add(createSleepingCat());
+  // 保存睡猫引用，呼吸动画不再逐帧遍历整棵场景树。
+  const sleepingCat = createSleepingCat();
+  scene.add(sleepingCat);
   scene.add(createMushroomDecor());
   scene.add(createBookshelf(materials));
   scene.add(createPantryShelf(materials, textures));
@@ -1624,6 +1628,21 @@ export function createInterior(textures, canvas) {
     winter: { wall: 0xaab8c1, rug: 0xd8e7ed, sky: 0xd9e9f1, key: 0xc7deea },
   };
 
+  const shadowLights = [frontKey, fireplace.fireLight, chandelier.light];
+  const invalidateShadows = () => {
+    shadowLights.forEach((light) => { light.shadow.needsUpdate = true; });
+  };
+  // 频率与暂停由主线 renderer.shadowMap 控制；灯光不单独缓存，以保留动态投影。
+  const setQuality = (profile = {}) => {
+    const applySize = (light, value) => {
+      if (!Number.isInteger(value) || value <= 0) return;
+      resizeShadow(light, value);
+    };
+    applySize(frontKey, profile.interiorShadowSize);
+    applySize(fireplace.fireLight, profile.pointShadowSize);
+    applySize(chandelier.light, profile.pointShadowSize);
+  };
+
   let currentSeason = 'autumn';
   const setSeason = (season) => {
     currentSeason = season;
@@ -1637,14 +1656,25 @@ export function createInterior(textures, canvas) {
     hemisphere.color.setHex(palette.sky);
     frontKey.color.setHex(palette.key);
     windowLight.color.setHex(season === 'winter' ? 0xa8cfde : season === 'autumn' ? 0x91b8c1 : 0xa6c8ca);
+    invalidateShadows();
   };
   setSeason('autumn');
 
+  // 排除持有动画引用的对象及所有灯光；各季节组仍在自身父节点内独立批处理。
+  const optimizationStats = optimizeStaticScene(scene, [
+    sleepingCat, rug, ...fireplace.flames, ...fireplace.coals,
+    ...chandelier.bulbs.map(({ glow }) => glow),
+    ...loftBed.bulbs.flatMap(({ bulb, glow }) => [bulb, glow]),
+    sideTable.glow, motes.points, (object) => object.isLight || object === frontKey.target,
+  ]);
+
   return {
     scene,
+    optimizationStats,
     camera,
     controls,
     setSeason,
+    setQuality,
     getSeason: () => currentSeason,
     update(elapsed, delta) {
       const flicker =
@@ -1675,8 +1705,7 @@ export function createInterior(textures, canvas) {
 
       kitchenLight.intensity = 10 * (0.95 + Math.sin(elapsed * 2.4) * 0.04);
       sideTable.light.intensity = 5 * (0.95 + Math.sin(elapsed * 3.4) * 0.05);
-      const cat = scene.getObjectByName('睡猫');
-      if (cat) cat.scale.y = 1 + Math.sin(elapsed * 1.2) * 0.018;
+      sleepingCat.scale.y = 1 + Math.sin(elapsed * 1.2) * 0.018;
       motes.update(elapsed);
     },
   };

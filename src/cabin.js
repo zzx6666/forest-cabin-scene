@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { mulberry32, randomRange } from './utils.js';
+import { optimizeStaticScene } from './scene-optimization.js';
 
 function addBox(parent, size, position, material, options = {}) {
   const mesh = new THREE.Mesh(new THREE.BoxGeometry(size[0], size[1], size[2]), material);
@@ -850,8 +851,16 @@ export function createCabin(textures) {
     group.add(leaf);
   }
 
+  // 窗面亮度、串灯缩放和提灯摆动由主线控制，必须保留原对象与动态矩阵。
+  const optimizationStats = optimizeStaticScene(group, [
+    ...windows.flatMap(({ pane, light, glow }) => [pane, light, glow]),
+    ...stringLights.bulbs.flatMap(({ bulb, glow }) => [bulb, glow]),
+    lantern.pivot,
+  ]);
+
   return {
     group,
+    optimizationStats,
     windows,
     stringLights,
     lantern,

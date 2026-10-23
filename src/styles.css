@@ -82,10 +82,6 @@ button { color: inherit; font: inherit; }
   pointer-events: none;
 }
 
-#app.is-tour-paused .lens-overlay::after {
-  animation-play-state: paused;
-}
-
 .edge-shade {
   z-index: 3;
   background:
@@ -170,6 +166,79 @@ button { color: inherit; font: inherit; }
   display: flex;
   gap: 9px;
   pointer-events: auto;
+}
+
+.performance-hud {
+  position: absolute;
+  top: calc(clamp(24px, 4vw, 56px) + 52px);
+  right: clamp(24px, 4vw, 56px);
+  z-index: 3;
+  width: 206px;
+  padding: 8px 10px 7px;
+  border: 1px solid rgba(235, 222, 196, 0.11);
+  border-radius: 10px;
+  background: rgba(9, 20, 17, 0.34);
+  box-shadow: 0 10px 28px rgba(2, 8, 6, 0.13), inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  color: rgba(245, 239, 226, 0.52);
+  font-size: 7px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.08em;
+  line-height: 1;
+  backdrop-filter: blur(13px) saturate(115%);
+  -webkit-backdrop-filter: blur(13px) saturate(115%);
+  pointer-events: none;
+}
+
+.performance-primary {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+}
+
+.performance-stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.performance-stat b {
+  color: var(--amber);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+}
+
+.performance-stat small {
+  color: rgba(245, 239, 226, 0.38);
+  font-size: 7px;
+  letter-spacing: 0.08em;
+}
+
+.performance-secondary {
+  display: flex;
+  gap: 12px;
+  margin-top: 6px;
+  white-space: nowrap;
+}
+
+.performance-secondary b {
+  color: rgba(245, 239, 226, 0.78);
+  font-weight: 500;
+}
+
+.performance-meta {
+  margin-top: 6px;
+  padding-top: 5px;
+  overflow: hidden;
+  border-top: 1px solid rgba(235, 222, 196, 0.08);
+  color: rgba(245, 239, 226, 0.32);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.performance-hud.is-idle .performance-stat b {
+  color: rgba(245, 239, 226, 0.5);
 }
 
 .scene-button {
@@ -272,7 +341,8 @@ button { color: inherit; font: inherit; }
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
 }
 
-#app.is-free-camera #scene-canvas { cursor: crosshair; }
+#app.is-free-camera #scene-canvas { cursor: none; }
+#app.is-free-camera.is-free-camera-cursor #scene-canvas { cursor: default; }
 #app.is-free-camera .tour-camera-hint { display: none; }
 #app.is-free-camera .free-camera-hint { display: flex; }
 
@@ -455,6 +525,7 @@ button { color: inherit; font: inherit; }
   .brand-panel h1 { font-size: clamp(44px, 13vw, 68px); letter-spacing: 0.03em; }
   .brand-panel > p { margin-top: 16px; font-size: 11px; letter-spacing: 0.12em; }
   .scene-actions { top: 20px; right: 20px; }
+  .performance-hud { top: 66px; right: 20px; width: 192px; }
   .scene-button { height: 38px; padding: 0 12px; background: rgba(12, 24, 22, 0.42); }
   .scene-button.icon-only { width: 38px; }
   .scene-footer { align-items: flex-end; margin-bottom: 2px; }
@@ -471,6 +542,9 @@ button { color: inherit; font: inherit; }
   .button-label { display: none; }
   .scene-button { width: 38px; padding: 0; }
   .brand-panel h1 { font-size: clamp(42px, 14.5vw, 58px); }
+  .performance-hud { width: 178px; }
+  .performance-primary { gap: 12px; }
+  .performance-secondary { gap: 8px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -713,4 +787,23 @@ button { color: inherit; font: inherit; }
     opacity: 1;
     filter: drop-shadow(0 0 7px rgba(228, 183, 116, 0.5));
   }
+}
+
+/* 场景暂停或页面转入后台时，装饰与待启用声音提示一起定格。 */
+#app:is(.is-tour-paused, .is-page-hidden) :is(.lens-overlay, .edge-shade),
+#app:is(.is-tour-paused, .is-page-hidden) :is(.lens-overlay, .edge-shade)::before,
+#app:is(.is-tour-paused, .is-page-hidden) :is(.lens-overlay, .edge-shade)::after,
+#app:is(.is-tour-paused, .is-page-hidden) :is(.loading-glow, .loading-mark span, .sound-pending .button-icon) {
+  animation-play-state: paused;
+}
+
+/* 加载退场仍保留原淡出过渡，内部循环动画结束后无需继续运行。 */
+.loading-screen:is([hidden], .is-leaving, .loading-is-leaving) :is(.loading-glow, .loading-mark span),
+.is-ready .loading-screen :is(.loading-glow, .loading-mark span),
+.loading-is-leaving .loading-screen :is(.loading-glow, .loading-mark span) {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sound-pending .button-icon { animation: none !important; }
 }

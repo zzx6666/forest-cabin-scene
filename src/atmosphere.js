@@ -197,6 +197,8 @@ function createFireflies() {
   geometry.setAttribute('aColor', new THREE.BufferAttribute(colors, 3));
   geometry.setAttribute('aPhase', new THREE.BufferAttribute(phases, 1));
   geometry.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1));
+  geometry.setAttribute('aAmplitude', new THREE.Float32BufferAttribute(amplitude.flatMap((value) => [value.x, value.y, value.z]), 3));
+  geometry.setAttribute('aSpeed', new THREE.Float32BufferAttribute(speeds, 1));
 
   const material = new THREE.ShaderMaterial({
     transparent: true,
@@ -205,6 +207,7 @@ function createFireflies() {
     toneMapped: false,
     uniforms: {
       uTime: { value: 0 },
+      uMotionEnabled: { value: 0 },
       uPixelRatio: { value: 1 },
       uVisibility: { value: 1 },
     },
@@ -212,7 +215,10 @@ function createFireflies() {
       attribute vec3 aColor;
       attribute float aPhase;
       attribute float aSize;
+      attribute vec3 aAmplitude;
+      attribute float aSpeed;
       uniform float uTime;
+      uniform float uMotionEnabled;
       uniform float uPixelRatio;
       varying vec3 vColor;
       varying float vAlpha;
@@ -220,7 +226,12 @@ function createFireflies() {
       void main() {
         vColor = aColor;
         vAlpha = 0.48 + 0.52 * pow(0.5 + 0.5 * sin(uTime * 1.8 + aPhase * 3.1), 2.0);
-        vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+        vec3 offset = vec3(
+          sin(uTime * aSpeed + aPhase),
+          sin(uTime * aSpeed * 0.72 + aPhase * 1.3),
+          cos(uTime * aSpeed * 0.84 + aPhase)
+        ) * aAmplitude;
+        vec4 mvPosition = modelViewMatrix * vec4(position + offset * uMotionEnabled, 1.0);
         gl_PointSize = aSize * uPixelRatio * (106.0 / max(2.0, -mvPosition.z));
         gl_Position = projectionMatrix * mvPosition;
       }
@@ -252,16 +263,9 @@ function createFireflies() {
     speeds,
     phases,
     update(elapsed) {
+      // 仅由场景更新时间驱动着色器，暂停时保留上一帧位置与闪烁。
       material.uniforms.uTime.value = elapsed;
-      const attribute = points.geometry.attributes.position;
-      for (let index = 0; index < count; index += 1) {
-        const phase = phases[index];
-        const speed = speeds[index];
-        attribute.array[index * 3] = base[index].x + Math.sin(elapsed * speed + phase) * amplitude[index].x;
-        attribute.array[index * 3 + 1] = base[index].y + Math.sin(elapsed * speed * 0.72 + phase * 1.3) * amplitude[index].y;
-        attribute.array[index * 3 + 2] = base[index].z + Math.cos(elapsed * speed * 0.84 + phase) * amplitude[index].z;
-      }
-      attribute.needsUpdate = true;
+      material.uniforms.uMotionEnabled.value = 1;
     },
   };
 }
@@ -365,8 +369,7 @@ function createDust(textures) {
   const random = mulberry32(27449);
   const count = 190;
   const positions = new Float32Array(count * 3);
-  const base = [];
-  const phases = [];
+  const phases = new Float32Array(count);
   for (let index = 0; index < count; index += 1) {
     const angle = random() * Math.PI * 2;
     const radius = Math.sqrt(random()) * 15;
@@ -376,11 +379,11 @@ function createDust(textures) {
     positions[index * 3] = x;
     positions[index * 3 + 1] = y;
     positions[index * 3 + 2] = z;
-    base.push(new THREE.Vector3(x, y, z));
-    phases.push(random() * Math.PI * 2);
+    phases[index] = random() * Math.PI * 2;
   }
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute('aPhase', new THREE.BufferAttribute(phases, 1));
   const material = new THREE.PointsMaterial({
     map: textures.softGlow,
     color: 0xffd4a2,
@@ -392,6 +395,26 @@ function createDust(textures) {
     blending: THREE.AdditiveBlending,
     toneMapped: false,
   });
+  const timeUniform = { value: 0 };
+  const motionUniform = { value: 0 };
+  // 保留原生点材质的雾、贴图、颜色和点尺寸，只替换周期性位移。
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uTime = timeUniform;
+    shader.uniforms.uMotionEnabled = motionUniform;
+    shader.vertexShader = `
+      attribute float aPhase;
+      uniform float uTime;
+      uniform float uMotionEnabled;
+    ` + shader.vertexShader.replace('#include <begin_vertex>', `
+      #include <begin_vertex>
+      transformed += vec3(
+        sin(uTime * 0.11 + aPhase) * 0.55,
+        sin(uTime * 0.16 + aPhase * 1.7) * 0.35,
+        cos(uTime * 0.09 + aPhase) * 0.48
+      ) * uMotionEnabled;
+    `);
+  };
+  material.customProgramCacheKey = () => 'dust-periodic-motion-v1';
   const points = new THREE.Points(geometry, material);
   points.frustumCulled = false;
   points.name = '浮尘';
@@ -399,15 +422,8 @@ function createDust(textures) {
   return {
     points,
     update(elapsed) {
-      const attribute = geometry.attributes.position;
-      for (let index = 0; index < count; index += 1) {
-        const phase = phases[index];
-        const basePoint = base[index];
-        attribute.array[index * 3] = basePoint.x + Math.sin(elapsed * 0.11 + phase) * 0.55;
-        attribute.array[index * 3 + 1] = basePoint.y + Math.sin(elapsed * 0.16 + phase * 1.7) * 0.35;
-        attribute.array[index * 3 + 2] = basePoint.z + Math.cos(elapsed * 0.09 + phase) * 0.48;
-      }
-      attribute.needsUpdate = true;
+      timeUniform.value = elapsed;
+      motionUniform.value = 1;
     },
   };
 }
@@ -582,10 +598,10 @@ export function createAtmosphere(scene, textures, smokeOrigin) {
       smoke.material.uniforms.uPixelRatio.value = pixelRatio;
     },
     update(elapsed, delta) {
-      fireflies.update(elapsed);
+      if (fireflies.points.visible) fireflies.update(elapsed);
       smoke.update(delta);
       dust.update(elapsed);
-      leaves.update(delta, elapsed);
+      if (leaves.points.visible) leaves.update(delta, elapsed);
       for (const layer of mist.layers) {
         layer.mesh.position.x = layer.baseX + Math.sin(elapsed * layer.speed + layer.phase) * 1.4;
         layer.mesh.position.z = layer.baseZ + Math.cos(elapsed * layer.speed * 0.76 + layer.phase) * 0.8;

@@ -3,9 +3,14 @@ import { mulberry32, randomRange } from './utils.js';
 
 function makeTexture(width, height, draw, options = {}) {
   const canvas = document.createElement('canvas');
-  canvas.width = width;
-  canvas.height = height;
+  const textureScale = options.textureScale ?? 1;
+  canvas.width = Math.max(1, Math.round(width * textureScale));
+  canvas.height = Math.max(1, Math.round(height * textureScale));
   const context = canvas.getContext('2d');
+  // 使用原始绘制坐标，缩小分辨率时保留图案比例、线宽和密度。
+  if (canvas.width !== width || canvas.height !== height) {
+    context.scale(canvas.width / width, canvas.height / height);
+  }
   draw(context, width, height);
   const texture = new THREE.CanvasTexture(canvas);
   if (options.color !== false) texture.colorSpace = THREE.SRGBColorSpace;
@@ -236,7 +241,8 @@ function paintStone(context, width, height, seed, bump = false) {
 
 function paintGround(context, width, height, seed) {
   const random = mulberry32(seed);
-  const image = context.createImageData(width, height);
+  // putImageData 不受坐标缩放影响，像素噪声直接按实际画布尺寸生成。
+  const image = context.createImageData(context.canvas.width, context.canvas.height);
   for (let index = 0; index < image.data.length; index += 4) {
     const grain = random();
     const green = 34 + grain * 21;
@@ -369,120 +375,81 @@ function paintLeaf(context, width, height) {
   context.stroke();
 }
 
+// 由调用方传入质量配置：高档、均衡为 1，移动端为 0.75，低档为 0.5。
+// 分辨率只在创建时选择；后续可遍历纹理修改 anisotropy 并标记 needsUpdate。
+export function createTextures(renderer, options = {}) {
+  const requestedAnisotropy = options.anisotropy ?? 16;
+  const anisotropy = Math.max(1, Math.min(
+    renderer.capabilities.getMaxAnisotropy(),
+    Number.isFinite(requestedAnisotropy) ? requestedAnisotropy : 16,
+  ));
+  const requestedScale = options.textureScale ?? 1;
+  const textureScale = Number.isFinite(requestedScale) && requestedScale > 0
+    ? Math.min(1, requestedScale)
+    : 1;
+  const makeProfileTexture = (width, height, draw, textureOptions) => makeTexture(
+    width, height, draw, { ...textureOptions, textureScale },
+  );
 
-function paintWindowGlow(context, width, height) {
-  const random = mulberry32(19471);
-  const glow = context.createRadialGradient(width * 0.52, height * 0.48, 8, width * 0.52, height * 0.5, width * 0.62);
-  glow.addColorStop(0, '#fff0ba');
-  glow.addColorStop(0.28, '#ffd183');
-  glow.addColorStop(0.62, '#e5984e');
-  glow.addColorStop(1, '#7f3d24');
-  context.fillStyle = glow;
-  context.fillRect(0, 0, width, height);
-
-  const topShade = context.createLinearGradient(0, 0, 0, height);
-  topShade.addColorStop(0, 'rgba(72, 31, 18, 0.48)');
-  topShade.addColorStop(0.26, 'rgba(103, 48, 25, 0.08)');
-  topShade.addColorStop(0.82, 'rgba(255, 218, 145, 0.04)');
-  topShade.addColorStop(1, 'rgba(76, 32, 17, 0.3)');
-  context.fillStyle = topShade;
-  context.fillRect(0, 0, width, height);
-
-  for (const side of [0, 1]) {
-    const x = side === 0 ? 0 : width * 0.78;
-    const curtain = context.createLinearGradient(x, 0, x + width * 0.22, 0);
-    curtain.addColorStop(0, 'rgba(54, 25, 17, 0.55)');
-    curtain.addColorStop(0.55, 'rgba(116, 58, 31, 0.48)');
-    curtain.addColorStop(1, 'rgba(240, 166, 88, 0)');
-    context.fillStyle = curtain;
-    context.fillRect(x, 0, width * 0.22, height);
-  }
-
-  for (let index = 0; index < 34; index += 1) {
-    context.strokeStyle = `rgba(92, 45, 24, ${randomRange(random, 0.015, 0.055)})`;
-    context.lineWidth = randomRange(random, 1, 3);
-    context.beginPath();
-    const x = random() * width;
-    context.moveTo(x, 0);
-    context.bezierCurveTo(x + randomRange(random, -8, 8), height * 0.3, x + randomRange(random, -10, 10), height * 0.7, x, height);
-    context.stroke();
-  }
-
-  const lowPlant = context.createRadialGradient(width * 0.63, height * 0.88, 1, width * 0.63, height * 0.88, width * 0.24);
-  lowPlant.addColorStop(0, 'rgba(54, 43, 24, 0.34)');
-  lowPlant.addColorStop(1, 'rgba(54, 43, 24, 0)');
-  context.fillStyle = lowPlant;
-  context.fillRect(0, height * 0.6, width, height * 0.4);
-}
-
-export function createTextures(renderer) {
-  const anisotropy = Math.min(16, renderer.capabilities.getMaxAnisotropy());
-
-  const woodMap = makeTexture(512, 512, (context, width, height) => {
+  const woodMap = makeProfileTexture(512, 512, (context, width, height) => {
     paintWood(context, width, height, 17, { light: '#7b4c2e', base: '#5d371f', dark: '#3d2216' });
   }, { repeat: [1.7, 1], anisotropy });
 
-  const woodBump = makeTexture(512, 512, (context, width, height) => {
+  const woodBump = makeProfileTexture(512, 512, (context, width, height) => {
     paintWoodBump(context, width, height, 19);
   }, { color: false, repeat: [1.7, 1], anisotropy });
 
-  const plankMap = makeTexture(512, 512, (context, width, height) => {
+  const plankMap = makeProfileTexture(512, 512, (context, width, height) => {
     paintWood(context, width, height, 31, { light: '#68452d', base: '#492f20', dark: '#281a13' });
   }, { repeat: [2.2, 1], anisotropy });
 
-  const plankBump = makeTexture(512, 512, (context, width, height) => {
+  const plankBump = makeProfileTexture(512, 512, (context, width, height) => {
     paintWoodBump(context, width, height, 37);
   }, { color: false, repeat: [2.2, 1], anisotropy });
 
-  const roofMap = makeTexture(1024, 1024, (context, width, height) => {
+  const roofMap = makeProfileTexture(1024, 1024, (context, width, height) => {
     paintRoof(context, width, height, 71, false);
   }, { repeat: [1, 1.3], anisotropy });
 
-  const roofBump = makeTexture(1024, 1024, (context, width, height) => {
+  const roofBump = makeProfileTexture(1024, 1024, (context, width, height) => {
     paintRoof(context, width, height, 73, true);
   }, { color: false, repeat: [1, 1.3], anisotropy });
 
-  const stoneMap = makeTexture(512, 512, (context, width, height) => {
+  const stoneMap = makeProfileTexture(512, 512, (context, width, height) => {
     paintStone(context, width, height, 91, false);
   }, { repeat: [2, 2], anisotropy });
 
-  const stoneBump = makeTexture(512, 512, (context, width, height) => {
+  const stoneBump = makeProfileTexture(512, 512, (context, width, height) => {
     paintStone(context, width, height, 97, true);
   }, { color: false, repeat: [2, 2], anisotropy });
 
-  const groundMap = makeTexture(1024, 1024, (context, width, height) => {
+  const groundMap = makeProfileTexture(1024, 1024, (context, width, height) => {
     paintGround(context, width, height, 113);
   }, { repeat: [8, 8], anisotropy });
 
-  const barkMap = makeTexture(256, 512, (context, width, height) => {
+  const barkMap = makeProfileTexture(256, 512, (context, width, height) => {
     paintBark(context, width, height, 127);
   }, { repeat: [2, 3], anisotropy });
 
-  const grassMap = makeTexture(256, 256, (context, width, height) => {
+  const grassMap = makeProfileTexture(256, 256, (context, width, height) => {
     paintGrass(context, width, height, 149);
   }, { anisotropy });
 
-  const windowMap = makeTexture(512, 512, (context, width, height) => {
-    paintWindowGlow(context, width, height);
-  }, { anisotropy: 1 });
-  windowMap.wrapS = THREE.ClampToEdgeWrapping;
-  windowMap.wrapT = THREE.ClampToEdgeWrapping;
-
-  const softGlow = makeTexture(128, 128, paintSoftGlow, { anisotropy: 1 });
+  const softGlow = makeProfileTexture(128, 128, paintSoftGlow, { anisotropy: 1 });
   softGlow.wrapS = THREE.ClampToEdgeWrapping;
   softGlow.wrapT = THREE.ClampToEdgeWrapping;
 
-  const smoke = makeTexture(128, 128, (context, width, height) => {
+  const smoke = makeProfileTexture(128, 128, (context, width, height) => {
     paintSmoke(context, width, height, 163);
   }, { anisotropy: 1 });
   smoke.wrapS = THREE.ClampToEdgeWrapping;
   smoke.wrapT = THREE.ClampToEdgeWrapping;
 
-  const leaf = makeTexture(128, 128, paintLeaf, { anisotropy: 1 });
+  const leaf = makeProfileTexture(128, 128, paintLeaf, { anisotropy: 1 });
   leaf.wrapS = THREE.ClampToEdgeWrapping;
   leaf.wrapT = THREE.ClampToEdgeWrapping;
 
-  return {
+  const textures = {
     woodMap,
     woodBump,
     plankMap,
@@ -498,4 +465,16 @@ export function createTextures(renderer) {
     smoke,
     leaf,
   };
+  const ownedTextures = Object.values(textures);
+  let disposed = false;
+  // 所有材质共享这些纹理及 repeat；调用方仅在整套不再使用时统一释放。
+  Object.defineProperty(textures, 'dispose', {
+    enumerable: false,
+    value() {
+      if (disposed) return;
+      disposed = true;
+      for (const texture of ownedTextures) texture.dispose();
+    },
+  });
+  return textures;
 }

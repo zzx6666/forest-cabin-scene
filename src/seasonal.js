@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { Reflector } from 'three/addons/objects/Reflector.js';
 import { mulberry32, randomRange, terrainHeight } from './utils.js';
+import { optimizeStaticScene } from './scene-optimization.js';
 
 // 木屋、门廊与烟囱的关键尺寸，与 cabin.js 的建筑坐标保持一致。
 const CABIN_LAYOUT = Object.freeze({
@@ -131,14 +132,14 @@ const WaterReflectionShader = {
   `,
 };
 
-function createWater(textures, center) {
+function createWater(textures, center, quality = {}) {
   const geometry = new THREE.CircleGeometry(1, 96);
   const water = new Reflector(geometry, {
     clipBias: 0.003,
-    textureWidth: window.innerWidth < 760 ? 512 : 1024,
-    textureHeight: window.innerWidth < 760 ? 512 : 1024,
+    textureWidth: quality.reflectionSize ?? (window.innerWidth < 760 ? 512 : 1024),
+    textureHeight: quality.reflectionSize ?? (window.innerWidth < 760 ? 512 : 1024),
     color: 0x9bb3aa,
-    multisample: 4,
+    multisample: quality.reflectionSamples ?? 4,
     shader: WaterReflectionShader,
   });
   water.rotation.x = -Math.PI / 2;
@@ -151,7 +152,7 @@ function createWater(textures, center) {
   return { water, material: water.material };
 }
 
-function createPond(textures) {
+function createPond(textures, quality) {
   const random = mulberry32(38119);
   const group = new THREE.Group();
   const center = new THREE.Vector3(9.8, 0, 4.2);
@@ -202,7 +203,7 @@ function createPond(textures) {
   basin.receiveShadow = true;
   group.add(basin);
 
-  const water = createWater(textures, center);
+  const water = createWater(textures, center, quality);
   group.add(water.water);
 
   const ripples = [];
@@ -340,10 +341,13 @@ function createPond(textures) {
     snowBanks.push(bank);
   }
 
+  const optimizationStats = optimizeStaticScene(group, [water.water, steamGroup, ...snowCaps, ...snowBanks, ...ripples]);
   return {
     group,
+    optimizationStats,
     center,
     water: water.material,
+    reflector: water.water,
     steamGroup,
     snowCaps,
     snowBanks,
@@ -852,8 +856,10 @@ function createSpringWorld() {
   });
 
   group.name = '春之花境';
+  const optimizationStats = optimizeStaticScene(group, [butterflies.group, ...rabbits, ...deerActors]);
   return {
     group,
+    optimizationStats,
     update(elapsed) {
       rabbits.forEach((rabbit) => {
         const data = rabbit.userData;
@@ -1257,8 +1263,10 @@ function createSummerWorld(textures, pondCenter) {
   });
 
   group.name = '夏日庭院';
+  const optimizationStats = optimizeStaticScene(group, [umbrella, ...flags, ...shoreFrogs]);
   return {
     group,
+    optimizationStats,
     update(elapsed) {
       umbrella.rotation.y = Math.sin(elapsed * 0.08) * 0.08;
       flags.forEach((flag, index) => {
@@ -1383,8 +1391,10 @@ function createPondLilies(center) {
   }
 
   group.name = '睡莲与青蛙';
+  const optimizationStats = optimizeStaticScene(group, frogs);
   return {
     group,
+    optimizationStats,
     frogs,
     update(elapsed) {
       frogs.forEach((frog) => {
@@ -1978,8 +1988,10 @@ function createWinterWorld(textures) {
   group.add(snowfall.points);
 
   group.name = '冬日雪境';
+  const optimizationStats = optimizeStaticScene(group, [...snowmen, snowfall.points]);
   return {
     group,
+    optimizationStats,
     update(elapsed, delta) {
       snowfall.update(delta, elapsed);
       snowmen.forEach((snowman, index) => {
@@ -2025,25 +2037,59 @@ function createFloatingLeaves(center, texture) {
   return mesh;
 }
 
-export function createSeasonalWorld(textures) {
+export function createSeasonalWorld(textures, initialQuality = {}) {
   const group = new THREE.Group();
   group.name = '四季场景';
-
-  const pond = createPond(textures);
+  const pond = createPond(textures, initialQuality);
   group.add(pond.group);
   const lilies = createPondLilies(pond.center);
   group.add(lilies.group);
-  const spring = createSpringWorld();
-  group.add(spring.group);
-  const summer = createSummerWorld(textures, pond.center);
-  group.add(summer.group);
-  const autumn = createAutumnWorld(textures);
-  autumn.group.add(createFloatingLeaves(pond.center, textures.leaf));
-  group.add(autumn.group);
-  const winter = createWinterWorld(textures);
-  group.add(winter.group);
-
-  let currentSeason = 'summer';
+  const worlds = new Map();
+  const pending = new Map();
+  let disposed = false;
+  const factories = {
+    spring: createSpringWorld,
+    summer: () => createSummerWorld(textures, pond.center),
+    autumn: () => {
+      const world = createAutumnWorld(textures);
+      world.group.add(createFloatingLeaves(pond.center, textures.leaf));
+      world.optimizationStats = optimizeStaticScene(world.group);
+      return world;
+    },
+    winter: () => createWinterWorld(textures),
+  };
+  const createSeason = season => {
+    if (disposed) return null;
+    if (worlds.has(season)) return worlds.get(season);
+    const world = factories[season]();
+    world.group.visible = season === currentSeason;
+    world.group.userData.season = season;
+    group.add(world.group);
+    worlds.set(season, world);
+    return world;
+  };
+  let currentSeason = 'spring';
+  createSeason('spring');
+  let quality = initialQuality;
+  let reflectionDirty = true;
+  let reflectionElapsed = 0;
+  let lastReflection = -Infinity;
+  let reflectionFrozen = false;
+  const lastCamera = new THREE.Matrix4();
+  const lastProjection = new THREE.Matrix4();
+  const reflect = pond.reflector.onBeforeRender;
+  pond.reflector.onBeforeRender = function(renderer, scene, camera, ...args) {
+    const cameraMoved = !camera.matrixWorld.equals(lastCamera) || !camera.projectionMatrix.equals(lastProjection);
+    const interval = 1 / (quality.reflectionHz ?? 60);
+    if (!reflectionDirty && !cameraMoved && (reflectionFrozen || reflectionElapsed - lastReflection < interval)) return;
+    // 播放时反射按画质频率更新；暂停时仅在镜头变化后更新静态倒影。
+    if (!reflectionDirty && !reflectionFrozen && reflectionElapsed - lastReflection < interval) return;
+    reflect.call(this, renderer, scene, camera, ...args);
+    lastCamera.copy(camera.matrixWorld);
+    lastProjection.copy(camera.projectionMatrix);
+    reflectionDirty = false;
+    lastReflection = reflectionElapsed;
+  };
   const colors = {
     spring: { deep: 0x204a44, shallow: 0x8eb9a4, foam: 0xe4efe3 },
     summer: { deep: 0x143d3b, shallow: 0x6c9e8c, foam: 0xcce2d5 },
@@ -2062,84 +2108,78 @@ export function createSeasonalWorld(textures) {
       { x: 12.4, z: -0.5, radius: 0.6 },
     ],
   };
-
-  const setSeason = (season) => {
+  const ensureSeason = season => {
+    if (!Object.hasOwn(factories, season)) return Promise.reject(new Error('未知季节'));
+    if (worlds.has(season)) return Promise.resolve(worlds.get(season));
+    if (!pending.has(season)) {
+      pending.set(season, new Promise(resolve => setTimeout(resolve, 0)).then(() => createSeason(season)).finally(() => pending.delete(season)));
+    }
+    return pending.get(season);
+  };
+  const setSeason = season => {
+    if (!worlds.has(season)) createSeason(season);
     currentSeason = season;
-    spring.group.visible = season === 'spring';
-    summer.group.visible = season === 'summer';
-    autumn.group.visible = season === 'autumn';
-    winter.group.visible = season === 'winter';
+    for (const [key, world] of worlds) world.group.visible = key === season;
     lilies.group.visible = season === 'spring' || season === 'summer';
-    lilies.frogs.forEach((frog) => {
-      frog.visible = season === 'summer';
-    });
-    pond.snowCaps.forEach((cap) => {
-      cap.visible = season === 'winter';
-    });
-    pond.snowBanks.forEach((bank) => {
-      bank.visible = season === 'winter';
-    });
-
+    lilies.frogs.forEach(frog => { frog.visible = season === 'summer'; });
+    pond.snowCaps.forEach(cap => { cap.visible = season === 'winter'; });
+    pond.snowBanks.forEach(bank => { bank.visible = season === 'winter'; });
+    pond.ripples.forEach(ring => { ring.visible = season !== 'winter'; });
+    pond.steamGroup.visible = season === 'winter';
     const palette = colors[season];
     pond.water.uniforms.uDeep.value.setHex(palette.deep);
     pond.water.uniforms.uShallow.value.setHex(palette.shallow);
     pond.water.uniforms.uFoam.value.setHex(palette.foam);
     pond.water.uniforms.uOpacity.value = season === 'winter' ? 0.88 : 0.82;
+    reflectionDirty = true;
   };
-  setSeason('summer');
-
+  setSeason('spring');
   return {
-    group,
-    setSeason,
+    group, setSeason, ensureSeason,
     getSeason: () => currentSeason,
     getCollisionCircles: () => collisionSets[currentSeason] ?? [],
+    getReadySeasons: () => [...worlds.keys()],
+    setQuality(profile) {
+      const target = pond.reflector.getRenderTarget();
+      const size = profile.reflectionSize;
+      if (size && (target.width !== size || target.samples !== profile.reflectionSamples)) {
+        target.samples = profile.reflectionSamples;
+        target.setSize(size, size);
+        target.dispose();
+      }
+      quality = profile;
+      reflectionDirty = true;
+    },
+    setFrozen(frozen) { reflectionFrozen = frozen; },
+    invalidateReflection() { reflectionDirty = true; },
+    dispose() { disposed = true; pond.reflector.dispose(); },
     update(elapsed, delta) {
+      reflectionElapsed = elapsed;
       pond.water.uniforms.uTime.value = elapsed;
-      if (currentSeason === 'spring') spring.update(elapsed);
-      if (currentSeason === 'summer') summer.update(elapsed);
+      const active = worlds.get(currentSeason);
+      active?.update?.(elapsed, delta);
       if (currentSeason === 'summer') lilies.update(elapsed);
-      if (currentSeason === 'winter') winter.update(elapsed, delta);
-
-      pond.ripples.forEach((ring) => {
+      if (currentSeason !== 'winter') pond.ripples.forEach(ring => {
         const progress = (elapsed * 0.085 + ring.userData.phase) % 1;
         const scale = 0.35 + progress * 3.1;
         ring.scale.set(scale * 0.82, scale, 1);
         ring.position.x = ring.userData.baseX + Math.sin(elapsed * 0.17 + ring.userData.phase * 9) * ring.userData.driftX;
         ring.position.z = ring.userData.baseZ + Math.cos(elapsed * 0.13 + ring.userData.phase * 7) * ring.userData.driftZ;
-        ring.material.opacity = currentSeason === 'winter' ? 0 : Math.sin(progress * Math.PI) * 0.09;
+        ring.material.opacity = Math.sin(progress * Math.PI) * 0.09;
       });
-
-      if (currentSeason === 'winter') {
-        pond.steamGroup.visible = true;
-        pond.steamGroup.children.forEach((sprite) => {
-          const data = sprite.userData;
-          const rise = (elapsed * data.speed + data.phase) % 1;
-          sprite.position.x = data.baseX + Math.sin(elapsed * 0.3 + data.phase) * 0.35;
-          sprite.position.y = data.baseY + rise * 3.1;
-          sprite.position.z = data.baseZ + Math.cos(elapsed * 0.21 + data.phase) * 0.24;
-          sprite.material.opacity = Math.sin(rise * Math.PI) * 0.22;
-          const driftScale = data.scale * (0.85 + rise * 0.55);
-          sprite.scale.set(driftScale * 1.4, driftScale, 1);
-        });
-      } else {
-        pond.steamGroup.visible = false;
-      }
+      if (currentSeason === 'winter') pond.steamGroup.children.forEach(sprite => {
+        const data = sprite.userData;
+        const rise = (elapsed * data.speed + data.phase) % 1;
+        sprite.position.x = data.baseX + Math.sin(elapsed * 0.3 + data.phase) * 0.35;
+        sprite.position.y = data.baseY + rise * 3.1;
+        sprite.position.z = data.baseZ + Math.cos(elapsed * 0.21 + data.phase) * 0.24;
+        sprite.material.opacity = Math.sin(rise * Math.PI) * 0.22;
+        const driftScale = data.scale * (0.85 + rise * 0.55);
+        sprite.scale.set(driftScale * 1.4, driftScale, 1);
+      });
     },
   };
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 function createTreeLeafTexture(type) {
   const canvas = document.createElement('canvas');
   canvas.width = 128;

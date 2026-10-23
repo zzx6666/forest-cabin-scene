@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#101c1b" />
+    <link rel="icon" href="data:," />
     <meta
       name="description"
       content="一座藏在四季森林里的童话木屋，可环绕观赏春之花丛、夏夜萤火、秋日金林、冬季温泉与完整室内场景。"
@@ -13,7 +14,7 @@
   </head>
   <body>
     <main id="app" aria-label="森林小屋三维场景">
-      <canvas id="scene-canvas" aria-label="可拖动环视的森林木屋三维场景"></canvas>
+      <canvas id="scene-canvas" aria-label="可自由环视的森林木屋三维场景"></canvas>
 
       <div class="lens-overlay" aria-hidden="true"></div>
       <div class="edge-shade" aria-hidden="true"></div>
@@ -75,6 +76,24 @@
           </button>
         </div>
 
+        <aside id="performance-hud" class="performance-hud" aria-label="实时渲染性能">
+          <div class="performance-primary">
+            <span class="performance-stat">
+              <b id="performance-fps">--</b>
+              <small>FPS</small>
+            </span>
+            <span class="performance-stat">
+              <b id="performance-work">--</b>
+              <small>CPU ms</small>
+            </span>
+          </div>
+          <div class="performance-secondary">
+            <span><b id="performance-draw">--</b> 次绘制</span>
+            <span><b id="performance-triangles">--</b> 三角形</span>
+          </div>
+          <div id="performance-meta" class="performance-meta">准备渲染</div>
+        </aside>
+
         <div id="tour-timer" class="tour-timer" aria-label="当前季节巡展时间">
           <div class="tour-timer-head">
             <span id="tour-state-label">自动巡展</span>
@@ -108,11 +127,14 @@
             <span class="keycap">W</span><span class="keycap">A</span><span class="keycap">S</span><span class="keycap">D</span>
             <span>移动</span>
             <i></i>
-            <span class="hint-key">拖动</span>
+            <span class="hint-key">移动鼠标</span>
             <span>观察</span>
             <i></i>
             <span class="hint-key">滚轮</span>
             <span>缩放</span>
+            <i></i>
+            <span class="hint-key">Alt</span>
+            <span>显示鼠标</span>
             <i></i>
             <span class="hint-key">空格</span>
             <span>继续巡展</span>

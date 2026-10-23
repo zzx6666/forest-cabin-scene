@@ -12,9 +12,9 @@ import { createLandscape } from './forest.js';
 import { createSeasonalField } from './field.js';
 import { createAtmosphere } from './atmosphere.js';
 import { createSeasonalWorld } from './seasonal.js';
-import { createInterior } from './interior.js';
 import { AmbientSoundscape } from './audio.js';
 import { terrainHeight } from './utils.js';
+import { AdaptiveQuality, FrameLoop, QUALITY_PROFILES, selectQuality, resizeShadow, disposeSceneResources } from './performance.js';
 
 const canvas = document.querySelector('#scene-canvas');
 const soundButton = document.querySelector('#sound-toggle');
@@ -41,6 +41,19 @@ const loadingCopy = document.querySelector('#loading-copy');
 const errorCard = document.querySelector('#error-card');
 const errorCopy = document.querySelector('#error-copy');
 const app = document.querySelector('#app');
+const performanceHud = {
+  root: document.querySelector('#performance-hud'),
+  fps: document.querySelector('#performance-fps'),
+  work: document.querySelector('#performance-work'),
+  draw: document.querySelector('#performance-draw'),
+  triangles: document.querySelector('#performance-triangles'),
+  meta: document.querySelector('#performance-meta'),
+};
+const parameters = new URLSearchParams(window.location.search);
+const qualityOverride = parameters.get('quality');
+const initialQuality = selectQuality({ width: window.innerWidth, coarsePointer: window.matchMedia('(pointer: coarse)').matches, override: qualityOverride });
+const debugEnabled = parameters.get('debug') === '1';
+const bootStarted = performance.now();
 
 const OUTDOOR_CAMERA = new THREE.Vector3(15.0, 7.05, 13.8);
 const OUTDOOR_TARGET = new THREE.Vector3(2.0, 1.8, 1.0);
@@ -52,6 +65,9 @@ const SHOWCASE_ORDER = ['spring', 'summer', 'autumn', 'winter'];
 const CAMERA_RETURN_DURATION = 0.85;
 const FREE_CAMERA_BOUNDS = { minX: -16, maxX: 20, minZ: -10, maxZ: 22 };
 const CABIN_FOOTPRINT = { minX: -5.35, maxX: 5.35, minZ: -4.55, maxZ: 5.95 };
+const QUALITY_LABELS = { high: '高画质', balanced: '均衡', mobile: '移动端', low: '低画质' };
+const HUD_REFRESH_MS = 500;
+const HUD_IDLE_MS = 900;
 
 const SEASONS = {
   spring: {
@@ -111,6 +127,96 @@ const SEASONS = {
     rimIntensity: 1.08,
   },
 };
+
+const hudState = {
+  frames: 0,
+  workMs: 0,
+  windowStartedAt: performance.now(),
+  lastRenderAt: -Infinity,
+  fps: 0,
+  cpuMs: 0,
+  intervalMs: 0,
+  drawCalls: 0,
+  triangles: 0,
+  idle: false,
+};
+let hudIdleTimer = null;
+
+function formatCompact(value) {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1).replace('.0', '')}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1).replace('.0', '')}k`;
+  return String(Math.round(value));
+}
+
+function updatePerformanceHud(forceIdle = null) {
+  if (!runtime || runtime.disposed) return;
+  const idle = forceIdle ?? performance.now() - hudState.lastRenderAt > HUD_IDLE_MS;
+  if (idle && hudState.idle) return;
+  if (idle !== hudState.idle) {
+    hudState.frames = 0;
+    hudState.workMs = 0;
+    hudState.intervalMs = 0;
+    hudState.windowStartedAt = performance.now();
+    if (idle) {
+      hudState.fps = 0;
+      hudState.cpuMs = 0;
+    }
+  }
+  hudState.idle = idle;
+  performanceHud.root.classList.toggle('is-idle', idle);
+  const displayedFps = Math.min(Math.round(hudState.fps), runtime.quality.fps);
+  performanceHud.fps.textContent = idle || hudState.fps <= 0 ? '--' : String(displayedFps);
+  performanceHud.work.textContent = idle || hudState.cpuMs <= 0 ? '--' : hudState.cpuMs.toFixed(1);
+  performanceHud.draw.textContent = formatCompact(hudState.drawCalls);
+  performanceHud.triangles.textContent = formatCompact(hudState.triangles);
+  const { renderer, quality } = runtime;
+  const resolution = `${renderer.domElement.width}×${renderer.domElement.height}`;
+  const qualityLabel = QUALITY_LABELS[quality.name] ?? quality.name;
+  performanceHud.meta.textContent = `${qualityLabel} · ${renderer.getPixelRatio()}x · ${idle ? '静止' : resolution}`;
+}
+
+function recordPerformanceFrame(workMs, drawCalls, triangles) {
+  const now = performance.now();
+  const frameInterval = hudState.lastRenderAt === -Infinity ? 0 : now - hudState.lastRenderAt;
+  hudState.lastRenderAt = now;
+  hudState.drawCalls = drawCalls;
+  hudState.triangles = triangles;
+  if (hudState.idle) {
+    hudState.idle = false;
+    hudState.frames = 0;
+    hudState.workMs = 0;
+    hudState.intervalMs = 0;
+    hudState.windowStartedAt = now;
+    return;
+  }
+  if (frameInterval > 0 && frameInterval < HUD_IDLE_MS) {
+    hudState.intervalMs = hudState.intervalMs > 0
+      ? hudState.intervalMs * 0.8 + frameInterval * 0.2
+      : frameInterval;
+  }
+  hudState.frames += 1;
+  hudState.workMs += workMs;
+  const elapsed = now - hudState.windowStartedAt;
+  if (elapsed < HUD_REFRESH_MS) return;
+  hudState.fps = hudState.intervalMs > 0 ? Math.min(1000 / hudState.intervalMs, 1000) : 0;
+  hudState.cpuMs = hudState.workMs / hudState.frames;
+  hudState.frames = 0;
+  hudState.workMs = 0;
+  hudState.windowStartedAt = now;
+  updatePerformanceHud(false);
+}
+
+function startPerformanceHud() {
+  hudState.frames = 0;
+  hudState.workMs = 0;
+  hudState.intervalMs = 0;
+  hudState.windowStartedAt = performance.now();
+  updatePerformanceHud(false);
+  hudIdleTimer = window.setInterval(() => {
+    if (document.hidden) return;
+    updatePerformanceHud();
+  }, HUD_REFRESH_MS);
+}
 
 const CinematicShader = {
   uniforms: {
@@ -197,18 +303,19 @@ function createEnvironmentTexture(renderer) {
   const renderTarget = pmrem.fromEquirectangular(environmentTexture);
   environmentTexture.dispose();
   pmrem.dispose();
-  return renderTarget.texture;
+  return renderTarget;
 }
 
 function setupRenderer() {
   const renderer = new THREE.WebGLRenderer({
     canvas,
-    antialias: true,
+    // 后处理链中的 SMAA 负责抗锯齿，默认帧缓冲无需重复 MSAA。
+    antialias: false,
     alpha: false,
     powerPreference: 'high-performance',
     stencil: false,
   });
-  const pixelRatio = Math.min(window.devicePixelRatio || 1, window.innerWidth < 760 ? 1.55 : 2);
+  const pixelRatio = Math.min(window.devicePixelRatio || 1, initialQuality.pixelRatio);
   renderer.setPixelRatio(pixelRatio);
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -216,6 +323,8 @@ function setupRenderer() {
   renderer.toneMappingExposure = 1.04;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.autoUpdate = false;
+  renderer.info.autoReset = false;
   renderer.setClearColor(0x0c1918, 1);
   return renderer;
 }
@@ -261,7 +370,7 @@ function createOutdoorWorld(renderer, environment) {
   keyLight.position.set(10, 16, 12);
   keyLight.target.position.set(0.2, 2.2, 0.2);
   keyLight.castShadow = true;
-  const shadowSize = window.innerWidth < 760 ? 1536 : 3072;
+  const shadowSize = initialQuality.shadowSize;
   keyLight.shadow.mapSize.set(shadowSize, shadowSize);
   keyLight.shadow.camera.left = -25;
   keyLight.shadow.camera.right = 25;
@@ -316,10 +425,84 @@ function setupPostProcessing(renderer, scene, camera) {
   composer.addPass(outputPass);
   composer.addPass(cinematicPass);
 
-  return { composer, renderPass, bloomPass, cinematicPass };
+  const originalBloomSetSize = bloomPass.setSize.bind(bloomPass);
+  let bloomScale = initialQuality.bloomScale;
+  bloomPass.setSize = (width, height) => originalBloomSetSize(Math.ceil(width * bloomScale), Math.ceil(height * bloomScale));
+  bloomPass.setSize(window.innerWidth * renderer.getPixelRatio(), window.innerHeight * renderer.getPixelRatio());
+  return { composer, renderPass, bloomPass, cinematicPass, smaaPass, setQuality(profile) { bloomScale = profile.bloomScale; smaaPass.enabled = profile.smaa; } };
 }
 
 let runtime = null;
+const lifecycle = new AbortController();
+const deferredTimers = new Set();
+
+function listen(target, type, listener, options = {}) {
+  target.addEventListener(type, listener, { ...(typeof options === 'boolean' ? { capture: options } : options), signal: lifecycle.signal });
+}
+
+function later(callback, milliseconds) {
+  const id = window.setTimeout(() => { deferredTimers.delete(id); if (!runtime?.disposed) callback(); }, milliseconds);
+  deferredTimers.add(id);
+  return id;
+}
+
+function invalidate({ shadows = false, reflection = false } = {}) {
+  if (!runtime || runtime.disposed) return;
+  runtime.dirty = true;
+  if (shadows) runtime.shadowDirty = true;
+  if (reflection) runtime.seasonalWorld.invalidateReflection();
+  runtime.loop?.wake();
+}
+
+function configureControls(controls) {
+  controls.addEventListener('start', () => {
+    controls.autoRotate = false;
+    runtime.userInteractedThisSeason = true;
+    hint.classList.add('hint-explored');
+    invalidate();
+  });
+  controls.addEventListener('change', () => invalidate());
+  controls.addEventListener('end', () => invalidate());
+}
+
+async function ensureInterior() {
+  if (runtime.interiorPromise) return runtime.interiorPromise;
+  if (runtime.interior) return runtime.interior;
+  if (!runtime.interiorPromise) runtime.interiorPromise = import('./interior.js').then(async ({ createInterior }) => {
+    if (runtime.disposed) return null;
+    const interior = createInterior(runtime.textures, canvas);
+    runtime.interior = interior;
+    interior.scene.environment = runtime.environment;
+    interior.scene.environmentIntensity = 0.16;
+    interior.controls.enabled = false;
+    interior.controls.autoRotate = false;
+    interior.setSeason(runtime.currentSeason);
+    interior.setQuality?.(runtime.quality);
+    configureControls(interior.controls);
+    await runtime.renderer.compileAsync(interior.scene, interior.camera);
+    invalidate({ shadows: true });
+    return interior;
+  }).catch(error => { runtime.interiorPromise = null; throw error; });
+  return runtime.interiorPromise;
+}
+
+function applyQuality(profile) {
+  if (!runtime || runtime.disposed) return;
+  runtime.quality = profile;
+  app.dataset.quality = profile.name;
+  runtime.loop.setTargetFps(profile.fps);
+  resizeShadow(runtime.outdoor.keyLight, profile.shadowSize);
+  runtime.interior?.setQuality?.(profile);
+  runtime.seasonalWorld.setQuality(profile);
+  runtime.postProcessing.setQuality(profile);
+  for (const texture of Object.values(runtime.textures)) {
+    if (texture?.isTexture && texture.anisotropy > 1) {
+      texture.anisotropy = Math.min(profile.anisotropy, runtime.renderer.capabilities.getMaxAnisotropy());
+      texture.needsUpdate = true;
+    }
+  }
+  runtime.resize();
+}
 const freeMoveVector = new THREE.Vector3();
 const freeRightVector = new THREE.Vector3();
 const freeLookDirection = new THREE.Vector3();
@@ -461,7 +644,10 @@ function enterFreeCameraMode() {
   state.active = true;
   state.returning = false;
   state.dragging = false;
+  state.lastX = null;
+  state.lastY = null;
   state.pointerId = null;
+  state.cursorUnlocked = false;
   state.yaw = Math.atan2(-direction.x, -direction.z);
   state.pitch = Math.asin(THREE.MathUtils.clamp(direction.y, -0.82, 0.58));
   state.heightOffset = THREE.MathUtils.clamp(
@@ -474,6 +660,7 @@ function enterFreeCameraMode() {
   runtime.outdoor.controls.autoRotate = false;
   runtime.outdoor.controls.enabled = false;
   app.classList.add('is-free-camera');
+  app.classList.remove('is-free-camera-cursor');
   updateInterfaceText();
   updateTourProgress();
 }
@@ -482,8 +669,9 @@ function pauseTour() {
   if (!runtime || runtime.busy || runtime.tourPaused || runtime.freeCamera?.returning) return;
   runtime.tourPaused = true;
   runtime.ambient?.pause();
+  invalidate();
   runtime.outdoor.controls.autoRotate = false;
-  runtime.interior.controls.autoRotate = false;
+  if (runtime.interior) runtime.interior.controls.autoRotate = false;
   if (runtime.currentView === 'outdoor') enterFreeCameraMode();
   updateInterfaceText();
   updateTourProgress();
@@ -496,7 +684,7 @@ function beginTourResume() {
     runtime.tourCompleted = false;
     runtime.tourElapsed = 0;
   }
-  runtime.ambient?.resume();
+  invalidate();
 
   if (runtime.currentView === 'outdoor' && runtime.freeCamera.active) {
     const camera = runtime.outdoor.camera;
@@ -508,16 +696,21 @@ function beginTourResume() {
     state.fromFov = camera.fov;
     state.keys.clear();
     state.dragging = false;
+    state.lastX = null;
+    state.lastY = null;
     state.pointerId = null;
+    state.cursorUnlocked = false;
     runtime.outdoor.controls.enabled = false;
     runtime.outdoor.controls.autoRotate = false;
     app.classList.remove('is-free-camera');
+    app.classList.remove('is-free-camera-cursor');
     updateTourProgress();
     updateInterfaceText();
     return;
   }
 
   runtime.tourPaused = false;
+  runtime.ambient?.resume();
   const controls = runtime.currentView === 'interior' ? runtime.interior.controls : runtime.outdoor.controls;
   controls.autoRotate = runtime.tourActive && !prefersReducedMotion;
   controls.enabled = true;
@@ -572,6 +765,7 @@ function updateFreeCameraReturn(delta) {
     runtime.outdoor.controls.autoRotate = runtime.tourActive && !prefersReducedMotion;
     runtime.outdoor.controls.update();
     runtime.tourPaused = false;
+    runtime.ambient?.resume();
     runtime.userInteractedThisSeason = false;
     updateTourProgress();
     updateInterfaceText();
@@ -585,13 +779,15 @@ function stopShowcase(completed = false, preservePause = false) {
   runtime.tourElapsed = 0;
   runtime.tourCompleted = completed;
   runtime.outdoor.controls.autoRotate = false;
-  runtime.interior.controls.autoRotate = false;
+  if (runtime.interior) runtime.interior.controls.autoRotate = false;
   updateTourProgress();
   updateInterfaceText();
-  if (completed && runtime.currentView === 'outdoor') {
+  if (completed) {
     runtime.tourPaused = true;
     runtime.ambient?.pause();
-    enterFreeCameraMode();
+    invalidate();
+    if (runtime.currentView === 'outdoor') enterFreeCameraMode();
+    else updateInterfaceText();
   }
 }
 
@@ -618,12 +814,13 @@ function updateShowcase(delta) {
 function applySeason(season) {
   if (!runtime) return;
   runtime.currentSeason = season;
+  invalidate({ shadows: true, reflection: true });
   const theme = SEASONS[season];
   runtime.landscape.setSeason(season);
   runtime.seasonalField.setSeason(season);
   runtime.seasonalWorld.setSeason(season);
   runtime.atmosphere.setSeason(season);
-  runtime.interior.setSeason(season);
+  runtime.interior?.setSeason(season);
   runtime.ambient.setMode(season, runtime.currentView);
 
   runtime.outdoor.keyLight.color.setHex(theme.key);
@@ -650,9 +847,16 @@ async function switchSeason(season, options = {}) {
   runtime.busy = true;
   if (automatic) runtime.tourElapsed = 0;
   sceneTransition.classList.add('is-active');
-  await delay(360);
+  invalidate();
+  await Promise.all([delay(360), runtime.seasonalWorld.ensureSeason(season)]);
+  if (runtime.disposed) return;
   applySeason(season);
+  const scene = runtime.currentView === 'interior' ? runtime.interior.scene : runtime.outdoor.scene;
+  const camera = runtime.currentView === 'interior' ? runtime.interior.camera : runtime.outdoor.camera;
+  await runtime.renderer.compileAsync(scene, camera);
+  if (runtime.disposed) return;
   await delay(180);
+  if (runtime.disposed) return;
   sceneTransition.classList.remove('is-active');
   runtime.busy = false;
 
@@ -673,22 +877,26 @@ async function switchView(view) {
   }
   runtime.busy = true;
   sceneTransition.classList.add('is-active');
-  await delay(380);
+  invalidate();
+  await Promise.all([delay(380), view === 'interior' ? ensureInterior() : Promise.resolve()]);
+  if (runtime.disposed) return;
   runtime.currentView = view;
   const indoor = view === 'interior';
   runtime.postProcessing.renderPass.scene = indoor ? runtime.interior.scene : runtime.outdoor.scene;
   runtime.postProcessing.renderPass.camera = indoor ? runtime.interior.camera : runtime.outdoor.camera;
   runtime.outdoor.controls.enabled = !indoor;
-  runtime.interior.controls.enabled = indoor;
+  if (runtime.interior) runtime.interior.controls.enabled = indoor;
   const activeControls = indoor ? runtime.interior.controls : runtime.outdoor.controls;
   activeControls.autoRotate =
     runtime.tourActive && !runtime.tourPaused && !runtime.userInteractedThisSeason && !prefersReducedMotion;
   activeControls.update();
   runtime.renderer.toneMappingExposure = indoor ? 1.2 : SEASONS[runtime.currentSeason].exposure;
   runtime.ambient.setMode(runtime.currentSeason, view);
+  invalidate({ shadows: true, reflection: true });
   if (!indoor && runtime.tourPaused) enterFreeCameraMode();
   updateInterfaceText();
   await delay(220);
+  if (runtime.disposed) return;
   sceneTransition.classList.remove('is-active');
   runtime.busy = false;
 }
@@ -713,6 +921,7 @@ async function resetActiveView() {
     getFreeCameraDirection(freeLookDirection);
     camera.lookAt(freeReturnPosition.copy(camera.position).add(freeLookDirection));
     runtime.userInteractedThisSeason = false;
+    invalidate();
     return;
   }
   runtime.busy = true;
@@ -733,6 +942,7 @@ async function resetActiveView() {
 
 function setupInterface() {
   const ambient = new AmbientSoundscape();
+  ambient.setVisibility?.(!document.hidden);
   ambient.setMode('spring', 'outdoor');
   runtime.ambient = ambient;
   let soundBusy = false;
@@ -763,13 +973,14 @@ function setupInterface() {
     soundBusy = true;
     syncSoundState(false, true);
     try {
+      if (runtime.tourPaused || runtime.freeCamera.returning) ambient.pause();
       const enabled = await ambient.enable();
       syncSoundState(enabled, !enabled);
       if (enabled) removeAudioUnlock();
       return enabled;
     } catch {
       syncSoundState(false, true);
-      window.setTimeout(() => {
+      later(() => {
         if (!ambient.enabled) syncSoundState(false, true);
       }, 1800);
       return false;
@@ -786,7 +997,7 @@ function setupInterface() {
     }
   };
 
-  soundButton.addEventListener('click', async () => {
+  listen(soundButton, 'click', async () => {
     if (soundBusy) return;
     if (ambient.enabled) {
       ambient.disable();
@@ -796,20 +1007,20 @@ function setupInterface() {
     await enableAudio();
   });
 
-  tourButton.addEventListener('click', toggleTourPlayback);
+  listen(tourButton, 'click', toggleTourPlayback);
 
   seasonButtons.forEach((button) => {
-    button.addEventListener('click', () => {
+    listen(button, 'click', () => {
       switchSeason(button.dataset.season);
     });
   });
 
-  viewButton.addEventListener('click', () => {
+  listen(viewButton, 'click', () => {
     switchView(runtime.currentView === 'outdoor' ? 'interior' : 'outdoor');
   });
-  resetButton.addEventListener('click', resetActiveView);
-  canvas.addEventListener('dblclick', resetActiveView);
-  canvas.addEventListener('pointerdown', () => hint.classList.add('hint-explored'), { once: true });
+  listen(resetButton, 'click', resetActiveView);
+  listen(canvas, 'dblclick', resetActiveView);
+  listen(canvas, 'pointerdown', () => hint.classList.add('hint-explored'), { once: true });
 
   const freeCamera = runtime.freeCamera;
   const endFreeDrag = (event) => {
@@ -818,20 +1029,31 @@ function setupInterface() {
     if (event && canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
     freeCamera.pointerId = null;
   };
-  canvas.addEventListener('pointerdown', (event) => {
-    if (!runtime.freeCamera.active || event.button !== 0) return;
+  listen(canvas, 'pointerdown', (event) => {
+    if (!runtime.freeCamera.active || event.pointerType === 'mouse' || event.button !== 0) return;
     runtime.freeCamera.dragging = true;
     runtime.freeCamera.pointerId = event.pointerId;
     runtime.freeCamera.lastX = event.clientX;
     runtime.freeCamera.lastY = event.clientY;
     canvas.setPointerCapture(event.pointerId);
   });
-  canvas.addEventListener('pointermove', (event) => {
-    if (!runtime.freeCamera.active || !runtime.freeCamera.dragging || event.pointerId !== runtime.freeCamera.pointerId) return;
+  listen(canvas, 'pointermove', (event) => {
+    if (!runtime.freeCamera.active || runtime.freeCamera.cursorUnlocked) return;
+    if (event.pointerType === 'mouse') {
+      if (runtime.freeCamera.lastX === null || runtime.freeCamera.lastY === null) {
+        runtime.freeCamera.lastX = event.clientX;
+        runtime.freeCamera.lastY = event.clientY;
+        return;
+      }
+    } else if (!runtime.freeCamera.dragging || event.pointerId !== runtime.freeCamera.pointerId) {
+      return;
+    }
     const deltaX = event.clientX - runtime.freeCamera.lastX;
     const deltaY = event.clientY - runtime.freeCamera.lastY;
     runtime.freeCamera.lastX = event.clientX;
     runtime.freeCamera.lastY = event.clientY;
+    if (Math.abs(deltaX) > 180 || Math.abs(deltaY) > 180) return;
+    invalidate();
     runtime.freeCamera.yaw -= deltaX * 0.0022;
     runtime.freeCamera.pitch = THREE.MathUtils.clamp(
       runtime.freeCamera.pitch - deltaY * 0.00165,
@@ -839,18 +1061,38 @@ function setupInterface() {
       0.55,
     );
   });
-  canvas.addEventListener('pointerup', endFreeDrag);
-  canvas.addEventListener('pointercancel', endFreeDrag);
-  canvas.addEventListener('wheel', (event) => {
+  listen(canvas, 'pointerleave', (event) => {
+    if (event.pointerType !== 'mouse') return;
+    runtime.freeCamera.lastX = null;
+    runtime.freeCamera.lastY = null;
+  });
+  const setFreeCameraCursorUnlocked = (unlocked) => {
+    if (!runtime.freeCamera.active || runtime.freeCamera.cursorUnlocked === unlocked) return;
+    runtime.freeCamera.cursorUnlocked = unlocked;
+    runtime.freeCamera.lastX = null;
+    runtime.freeCamera.lastY = null;
+    runtime.freeCamera.keys.clear();
+    app.classList.toggle('is-free-camera-cursor', unlocked);
+    invalidate();
+  };
+  listen(canvas, 'pointerup', endFreeDrag);
+  listen(canvas, 'pointercancel', endFreeDrag);
+  listen(canvas, 'wheel', (event) => {
     if (!runtime.freeCamera.active) return;
     event.preventDefault();
     runtime.freeCamera.fov = THREE.MathUtils.clamp(runtime.freeCamera.fov + event.deltaY * 0.026, 26, 62);
     runtime.outdoor.camera.fov = runtime.freeCamera.fov;
     runtime.outdoor.camera.updateProjectionMatrix();
+    invalidate();
   }, { passive: false });
 
   const isInteractiveTarget = (target) => target instanceof Element && Boolean(target.closest('button, a, input, textarea, select'));
-  window.addEventListener('keydown', (event) => {
+  listen(window, 'keydown', (event) => {
+    if (event.key === 'Alt' && runtime.freeCamera.active) {
+      event.preventDefault();
+      setFreeCameraCursorUnlocked(true);
+      return;
+    }
     if (event.code === 'Space' && !isInteractiveTarget(event.target)) {
       event.preventDefault();
       toggleTourPlayback();
@@ -860,27 +1102,28 @@ function setupInterface() {
     if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ShiftLeft', 'ShiftRight'].includes(event.code)) {
       event.preventDefault();
       runtime.freeCamera.keys.add(event.code);
+      invalidate();
     }
   });
-  window.addEventListener('keyup', (event) => {
+  listen(window, 'keyup', (event) => {
+    if (event.key === 'Alt') {
+      setFreeCameraCursorUnlocked(false);
+      return;
+    }
     runtime.freeCamera.keys.delete(event.code);
+    invalidate();
   });
-  window.addEventListener('blur', () => {
+  listen(window, 'blur', () => {
     runtime.freeCamera.keys.clear();
     endFreeDrag();
+    setFreeCameraCursorUnlocked(false);
   });
 
-  [runtime.outdoor.controls, runtime.interior.controls].forEach((controls) => {
-    controls.addEventListener('start', () => {
-      controls.autoRotate = false;
-      runtime.userInteractedThisSeason = true;
-      hint.classList.add('hint-explored');
-    });
-  });
+  configureControls(runtime.outdoor.controls);
 
-  window.addEventListener('pointerdown', unlockAudio, true);
-  window.addEventListener('keydown', unlockAudio, true);
-  window.setTimeout(() => {
+  listen(window, 'pointerdown', unlockAudio, true);
+  listen(window, 'keydown', unlockAudio, true);
+  later(() => {
     if (!ambient.enabled) enableAudio();
   }, 900);
 }
@@ -889,193 +1132,227 @@ async function boot() {
   loadingCopy.textContent = '整理四季与林间灯火…';
   loadingBar.style.width = '10%';
   await nextFrame();
-
   const renderer = setupRenderer();
+  const environmentTarget = createEnvironmentTexture(renderer);
+  const environment = environmentTarget.texture;
   loadingBar.style.width = '24%';
-  const environment = createEnvironmentTexture(renderer);
-  const textures = createTextures(renderer);
+  await nextFrame();
+  const textures = createTextures(renderer, initialQuality);
+  const outdoor = createOutdoorWorld(renderer, environment);
   loadingBar.style.width = '38%';
   loadingCopy.textContent = '种下会随四季变化的树林…';
-
-  const outdoor = createOutdoorWorld(renderer, environment);
+  await nextFrame();
   const landscape = createLandscape(textures);
   outdoor.scene.add(landscape.group);
   const seasonalField = createSeasonalField();
   outdoor.scene.add(seasonalField.group);
   loadingBar.style.width = '52%';
   loadingCopy.textContent = '竖起原木小屋与阁楼…';
-
+  await nextFrame();
   const cabin = createCabin(textures);
   outdoor.scene.add(cabin.group);
-  const seasonalWorld = createSeasonalWorld(textures);
+  loadingBar.style.width = '68%';
+  await nextFrame();
+  const seasonalWorld = createSeasonalWorld(textures, initialQuality);
   outdoor.scene.add(seasonalWorld.group);
   const atmosphere = createAtmosphere(outdoor.scene, textures, cabin.smokeTip);
   atmosphere.setPixelRatio(renderer.getPixelRatio());
-  loadingBar.style.width = '68%';
-  loadingCopy.textContent = '摆好花丛、温泉与林间动物…';
-
-  const interior = createInterior(textures, canvas);
-  interior.scene.environment = environment;
-  interior.scene.environmentIntensity = 0.16;
-  loadingBar.style.width = '82%';
-  loadingCopy.textContent = '点亮壁炉与室内灯火…';
-
   const postProcessing = setupPostProcessing(renderer, outdoor.scene, outdoor.camera);
   runtime = {
-    renderer,
-    textures,
-    environment,
-    outdoor,
-    landscape,
-    seasonalField,
-    cabin,
-    seasonalWorld,
-    atmosphere,
-    interior,
-    postProcessing,
-    currentSeason: 'spring',
-    currentView: 'outdoor',
-    busy: false,
-    tourActive: true,
-    tourElapsed: 0,
-    tourCompleted: false,
-    tourPaused: false,
-    lastTourDisplaySecond: -1,
-    lastTourStateLabel: '',
-    userInteractedThisSeason: false,
+    renderer, textures, environment, environmentTarget, outdoor, landscape,
+    seasonalField, cabin, seasonalWorld, atmosphere, postProcessing,
+    interior: null, interiorPromise: null,
+    currentSeason: 'spring', currentView: 'outdoor', busy: false,
+    tourActive: true, tourElapsed: 0, tourCompleted: false, tourPaused: false,
+    lastTourDisplaySecond: -1, lastTourStateLabel: '', userInteractedThisSeason: false,
+    quality: initialQuality, dirty: true, shadowDirty: true, sceneElapsed: 0,
+    disposed: false, renders: 0, samples: [], firstFrameMs: 0,
     freeCamera: {
-      active: false,
-      returning: false,
-      dragging: false,
-      pointerId: null,
-      lastX: 0,
-      lastY: 0,
-      yaw: 0,
-      pitch: 0,
-      fov: 40,
-      heightOffset: 5,
-      returnElapsed: 0,
-      fromFov: 40,
-      fromPosition: new THREE.Vector3(),
-      keys: new Set(),
+      active: false, returning: false, dragging: false, pointerId: null,
+      cursorUnlocked: false, lastX: null, lastY: null, yaw: 0, pitch: 0, fov: 40, heightOffset: 5,
+      returnElapsed: 0, fromFov: 40, fromPosition: new THREE.Vector3(), keys: new Set(),
     },
     ambient: null,
   };
-  setupInterface();
-  applySeason('spring');
-  outdoor.controls.enabled = true;
-  outdoor.controls.autoRotate = !prefersReducedMotion;
-  interior.controls.enabled = false;
-  interior.controls.autoRotate = !prefersReducedMotion;
-  updateTourProgress();
-
-  const windowStates = cabin.windows.map((window) => ({
-    window,
-    baseLight: window.light.intensity,
-    baseEmissive: window.pane.material.emissiveIntensity,
-  }));
-  const bulbStates = cabin.stringLights.bulbs.map(({ bulb, glow, phase, baseGlow }) => ({
-    bulb,
-    glow,
-    phase,
-    baseGlow,
-  }));
-
-  const handleResize = () => {
-    const pixelRatio = Math.min(window.devicePixelRatio || 1, window.innerWidth < 760 ? 1.55 : 2);
-    outdoor.camera.aspect = window.innerWidth / window.innerHeight;
-    outdoor.camera.fov = runtime.freeCamera.active
-      ? runtime.freeCamera.fov
-      : getResponsiveFov(outdoor.camera.aspect, 40);
-    outdoor.camera.updateProjectionMatrix();
-    interior.camera.aspect = window.innerWidth / window.innerHeight;
-    interior.camera.fov = interior.camera.aspect < 0.7 ? 64 : interior.camera.aspect < 0.95 ? 56 : 46;
-    interior.camera.updateProjectionMatrix();
-    renderer.setPixelRatio(pixelRatio);
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    postProcessing.composer.setPixelRatio(pixelRatio);
-    postProcessing.composer.setSize(window.innerWidth, window.innerHeight);
-    postProcessing.cinematicPass.uniforms.uResolution.value.set(window.innerWidth, window.innerHeight);
-    atmosphere.setPixelRatio(pixelRatio);
-  };
-  window.addEventListener('resize', handleResize, { passive: true });
-
-  try {
-    await document.fonts.ready;
-  } catch {
-    // 字体加载失败不会阻断三维场景。
-  }
-
-  try {
-    await renderer.compileAsync(outdoor.scene, outdoor.camera);
-    await renderer.compileAsync(interior.scene, interior.camera);
-  } catch (error) {
-    console.warn('预编译着色器未完成，将在首帧继续编译：', error);
-  }
-
-  postProcessing.composer.render();
-  loadingBar.style.width = '100%';
-  loadingCopy.textContent = '四季已经就位';
-
-  let sceneElapsed = 0;
-  let previousTime = performance.now();
-  const animate = (now) => {
-    requestAnimationFrame(animate);
-    const rawDelta = (now - previousTime) / 1000;
-    previousTime = now;
+  const windowStates = cabin.windows.map(window => ({ window, baseLight: window.light.intensity, baseEmissive: window.pane.material.emissiveIntensity }));
+  const bulbStates = cabin.stringLights.bulbs;
+  let lastShadowUpdate = -Infinity;
+  const renderFrame = (now, rawDelta) => {
+    if (runtime.disposed || document.hidden) return false;
+    const frameStart = performance.now();
     const delta = Math.min(rawDelta, 0.05);
+    updateShowcase(Math.min(rawDelta, 1));
     const worldFrozen = runtime.tourPaused || runtime.freeCamera.returning;
-    if (!worldFrozen) sceneElapsed += delta;
-
-    updateShowcase(Math.min(rawDelta, 1.0));
-
+    seasonalWorld.setFrozen(worldFrozen);
+    const updateStart = performance.now();
+    let cameraChanged = false;
+    if (!worldFrozen) runtime.sceneElapsed += delta;
+    const elapsed = runtime.sceneElapsed;
     if (runtime.currentView === 'outdoor') {
       if (!worldFrozen) {
-        landscape.update(sceneElapsed);
-        seasonalField.update(sceneElapsed);
-        atmosphere.update(sceneElapsed, delta);
-        seasonalWorld.update(sceneElapsed, delta);
-      }
-      if (runtime.freeCamera.returning) updateFreeCameraReturn(delta);
-      else if (runtime.freeCamera.active) updateFreeCamera(delta);
-      else outdoor.controls.update();
-
-      if (!worldFrozen) {
+        landscape.update(elapsed);
+        seasonalField.update(elapsed);
+        atmosphere.update(elapsed, delta);
+        seasonalWorld.update(elapsed, delta);
         windowStates.forEach(({ window, baseLight, baseEmissive }, index) => {
-          const flicker =
-            0.965 +
-            Math.sin(sceneElapsed * 1.3 + index * 2.17) * 0.022 +
-            Math.sin(sceneElapsed * 6.8 + index * 4.41) * 0.01;
+          const flicker = 0.965 + Math.sin(elapsed * 1.3 + index * 2.17) * 0.022 + Math.sin(elapsed * 6.8 + index * 4.41) * 0.01;
           window.light.intensity = baseLight * flicker;
           window.pane.material.emissiveIntensity = baseEmissive * flicker;
         });
-        cabin.lantern.pivot.rotation.z = Math.sin(sceneElapsed * 0.78) * 0.028;
-        cabin.lantern.pivot.rotation.x = Math.cos(sceneElapsed * 0.57) * 0.014;
-        cabin.lantern.light.intensity = 17 + Math.sin(sceneElapsed * 2.1) * 0.55;
+        cabin.lantern.pivot.rotation.z = Math.sin(elapsed * 0.78) * 0.028;
+        cabin.lantern.pivot.rotation.x = Math.cos(elapsed * 0.57) * 0.014;
+        cabin.lantern.light.intensity = 17 + Math.sin(elapsed * 2.1) * 0.55;
         bulbStates.forEach(({ bulb, glow, phase, baseGlow }) => {
-          const pulse = 0.5 + 0.5 * Math.sin(sceneElapsed * 1.55 + phase);
+          const pulse = 0.5 + 0.5 * Math.sin(elapsed * 1.55 + phase);
           glow.material.opacity = baseGlow * (0.68 + pulse * 0.32);
           const glowScale = 0.43 + pulse * 0.08;
           glow.scale.set(glowScale, glowScale, 1);
           bulb.scale.setScalar(0.9 + pulse * 0.13);
         });
       }
-    } else {
-      if (!worldFrozen) interior.update(sceneElapsed, delta);
-      interior.controls.update();
+      if (runtime.freeCamera.returning) { updateFreeCameraReturn(delta); cameraChanged = true; }
+      else if (runtime.freeCamera.active) { updateFreeCamera(delta); cameraChanged = runtime.freeCamera.keys.size > 0; }
+      else cameraChanged = outdoor.controls.update(delta);
+    } else if (runtime.interior) {
+      if (!worldFrozen) runtime.interior.update(elapsed, delta);
+      cameraChanged = runtime.interior.controls.update(delta);
     }
-
-    postProcessing.cinematicPass.uniforms.uTime.value = sceneElapsed;
-    postProcessing.composer.render();
+    const updateMs = performance.now() - updateStart;
+    const shouldRender = !worldFrozen || runtime.dirty || cameraChanged;
+    if (shouldRender) {
+      runtime.dirty = false;
+      const shadowDue = !worldFrozen && elapsed - lastShadowUpdate >= 1 / runtime.quality.shadowHz;
+      renderer.shadowMap.needsUpdate = runtime.shadowDirty || shadowDue;
+      if (renderer.shadowMap.needsUpdate) {
+        runtime.shadowDirty = false;
+        lastShadowUpdate = elapsed;
+      }
+      postProcessing.cinematicPass.uniforms.uTime.value = elapsed;
+      renderer.info.reset();
+      postProcessing.composer.render(delta);
+      runtime.renders += 1;
+      recordPerformanceFrame(performance.now() - frameStart, renderer.info.render.calls, renderer.info.render.triangles);
+      if (debugEnabled) {
+        runtime.samples.push({ delta: rawDelta * 1000, work: performance.now() - frameStart, update: updateMs, calls: renderer.info.render.calls, triangles: renderer.info.render.triangles });
+        if (runtime.samples.length > 20000) runtime.samples.shift();
+      }
+    }
+    if (!worldFrozen && !runtime.busy && rawDelta > 0) runtime.adaptive.sample(rawDelta * 1000);
+    return !worldFrozen || runtime.freeCamera.returning || runtime.freeCamera.keys.size > 0 || cameraChanged || runtime.dirty;
   };
-
-  requestAnimationFrame(animate);
-  await delay(420);
-  loadingScreen.classList.add('is-leaving');
+  // 巡展、自由预览和室内共用同一个限帧调度，避免自由视角绕过设备上限。
+  runtime.loop = new FrameLoop(renderFrame, { fps: initialQuality.fps });
+  runtime.adaptive = new AdaptiveQuality(initialQuality, { locked: Boolean(QUALITY_PROFILES[qualityOverride]), onChange: applyQuality });
+  runtime.resize = () => {
+    const width = window.innerWidth;
+    const height = window.innerHeight;
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, runtime.quality.pixelRatio);
+    outdoor.camera.aspect = width / height;
+    outdoor.camera.fov = runtime.freeCamera.active ? runtime.freeCamera.fov : getResponsiveFov(outdoor.camera.aspect, 40);
+    outdoor.camera.updateProjectionMatrix();
+    if (runtime.interior) {
+      const camera = runtime.interior.camera;
+      camera.aspect = width / height;
+      camera.fov = camera.aspect < 0.7 ? 64 : camera.aspect < 0.95 ? 56 : 46;
+      camera.updateProjectionMatrix();
+    }
+    renderer.setPixelRatio(pixelRatio);
+    renderer.setSize(width, height);
+    postProcessing.composer.setPixelRatio(pixelRatio);
+    postProcessing.composer.setSize(width, height);
+    postProcessing.cinematicPass.uniforms.uResolution.value.set(width, height);
+    atmosphere.setPixelRatio(pixelRatio);
+    invalidate({ shadows: true, reflection: true });
+  };
+  let resizePending = false;
+  listen(window, 'resize', () => {
+    if (resizePending) return;
+    resizePending = true;
+    later(() => { resizePending = false; runtime.resize(); }, 80);
+  }, { passive: true });
+  const handleVisibility = () => {
+    const visible = !document.hidden;
+    app.classList.toggle('is-page-hidden', !visible);
+    runtime.freeCamera.keys.clear();
+    runtime.freeCamera.dragging = false;
+    runtime.freeCamera.cursorUnlocked = false;
+    app.classList.remove('is-free-camera-cursor');
+    runtime.freeCamera.lastX = null;
+    runtime.freeCamera.lastY = null;
+    hudState.frames = 0;
+    hudState.workMs = 0;
+    hudState.intervalMs = 0;
+    hudState.windowStartedAt = performance.now();
+    runtime.ambient?.setVisibility?.(visible);
+    runtime.adaptive.reset();
+    runtime.loop.setVisible(visible);
+    if (visible) invalidate();
+  };
+  listen(document, 'visibilitychange', handleVisibility);
+  listen(window, 'pagehide', event => {
+    if (!event.persisted) disposeRuntime();
+    else runtime.loop.setVisible(false);
+  });
+  listen(window, 'pageshow', handleVisibility);
+  setupInterface();
+  applySeason('spring');
+  startPerformanceHud();
+  app.dataset.quality = initialQuality.name;
+  outdoor.controls.enabled = true;
+  outdoor.controls.autoRotate = !prefersReducedMotion;
+  updateTourProgress();
+  loadingBar.style.width = '86%';
+  loadingCopy.textContent = '点亮窗边灯火…';
+  try { await renderer.compileAsync(outdoor.scene, outdoor.camera); }
+  catch (error) { console.warn('预编译着色器未完成，将在首帧继续编译：', error); }
+  renderer.shadowMap.needsUpdate = true;
+  renderer.info.reset();
+  seasonalWorld.update(0, 0);
+  atmosphere.update(0, 0);
+  postProcessing.composer.render(0);
+  runtime.firstFrameMs = performance.now() - bootStarted;
+  runtime.shadowDirty = false;
+  loadingBar.style.width = '100%';
+  loadingCopy.textContent = '春日已经就位';
   app.classList.add('is-ready');
-  window.setTimeout(() => {
-    loadingScreen.hidden = true;
-  }, 1700);
+  loadingScreen.classList.add('is-leaving');
+  later(() => { loadingScreen.hidden = true; }, 1300);
+  if (debugEnabled) window.__forestDebug = {
+    runtime, switchSeason, switchView, pauseTour, beginTourResume, resetActiveView,
+    ensureInterior, applyQuality, invalidate, dispose: disposeRuntime,
+    get samples() { return runtime.samples; },
+    snapshot: () => ({ season: runtime.currentSeason, view: runtime.currentView, paused: runtime.tourPaused, sceneElapsed: runtime.sceneElapsed, tourElapsed: runtime.tourElapsed, renders: runtime.renders, pendingFrame: runtime.loop.pending, quality: runtime.quality.name, readySeasons: seasonalWorld.getReadySeasons(), memory: { ...renderer.info.memory }, firstFrameMs: runtime.firstFrameMs }),
+  };
+  handleVisibility();
+  // 首帧后错开室内与其他季节的准备；切换时仍会等待同一个准备任务。
+  const warmRemaining = async index => {
+    if (runtime.disposed || index >= SHOWCASE_ORDER.length) return;
+    if (document.hidden || runtime.busy) { later(() => warmRemaining(index), 2000); return; }
+    await seasonalWorld.ensureSeason(SHOWCASE_ORDER[index]);
+    if (!runtime.disposed) later(() => warmRemaining(index + 1), 4000);
+  };
+  later(() => { if (!document.hidden) ensureInterior().catch(error => console.warn('室内预热延后：', error)); }, 2500);
+  later(() => warmRemaining(1).catch(error => console.warn('季节预热延后：', error)), 6500);
+}
+
+function disposeRuntime() {
+  if (!runtime || runtime.disposed) return;
+  runtime.disposed = true;
+  runtime.loop.dispose();
+  lifecycle.abort();
+  if (hudIdleTimer !== null) window.clearInterval(hudIdleTimer);
+  hudIdleTimer = null;
+  for (const timer of deferredTimers) window.clearTimeout(timer);
+  deferredTimers.clear();
+  runtime.outdoor.controls.dispose();
+  runtime.interior?.controls.dispose();
+  runtime.ambient?.dispose?.();
+  runtime.seasonalWorld.dispose();
+  for (const pass of runtime.postProcessing.composer.passes) pass.dispose?.();
+  runtime.postProcessing.composer.dispose();
+  disposeSceneResources([runtime.outdoor.scene, runtime.interior?.scene], Object.values(runtime.textures));
+  runtime.environmentTarget.dispose();
+  runtime.renderer.dispose();
 }
 
 boot().catch(showError);

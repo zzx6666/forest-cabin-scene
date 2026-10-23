@@ -1,295 +1,282 @@
-import { mulberry32 } from './utils.js';
-
 /**
  * 程序化环境声：不依赖外部音频文件。
- * 风声、柴火、虫鸣、蛙声与鸟鸣都在浏览器内实时合成。
+ * 风声、柴火、虫鸣、蛙声与鸟鸣都由 Worker 或分片降级路径在浏览器内合成。
  */
+
+const TRACK_NAMES = Object.freeze(['wind', 'gust', 'crackle', 'cricket', 'cicada', 'frog', 'bird', 'music']);
+
+const MIX_LEVELS = Object.freeze({
+  indoor: Object.freeze({ wind: 0.11, gust: 0.018, crackle: 0.5, cricket: 0.008, cicada: 0, frog: 0, bird: 0 }),
+  spring: Object.freeze({ wind: 0.32, gust: 0.08, crackle: 0.045, cricket: 0.05, cicada: 0.02, frog: 0.02, bird: 0.32 }),
+  summer: Object.freeze({ wind: 0.24, gust: 0.06, crackle: 0.035, cricket: 0.34, cicada: 0.56, frog: 0.62, bird: 0.08 }),
+  winter: Object.freeze({ wind: 0.3, gust: 0.04, crackle: 0.035, cricket: 0, cicada: 0, frog: 0, bird: 0 }),
+  autumn: Object.freeze({ wind: 0.38, gust: 0.11, crackle: 0.045, cricket: 0.18, cicada: 0.08, frog: 0, bird: 0.025 }),
+});
+
+const TRACK_SETTINGS = Object.freeze({
+  wind: Object.freeze({ filter: 'lowpass', frequency: 450, gain: 0.34, pan: -0.12, q: 0.5 }),
+  gust: Object.freeze({ filter: 'bandpass', frequency: 780, gain: 0.08, pan: 0.34, q: 0.55 }),
+  crackle: Object.freeze({ filter: 'highpass', frequency: 720, gain: 0.34, pan: 0.28, q: 1 }),
+  cricket: Object.freeze({ filter: 'bandpass', frequency: 4050, gain: 0.18, pan: -0.35, q: 2.2 }),
+  cicada: Object.freeze({ filter: 'bandpass', frequency: 5000, gain: 0.2, pan: 0.42, q: 1.25 }),
+  frog: Object.freeze({ filter: 'lowpass', frequency: 330, gain: 0.26, pan: -0.18, q: 0.6 }),
+  bird: Object.freeze({ filter: 'bandpass', frequency: 2850, gain: 0.16, pan: 0.28, q: 1.2 }),
+  music: Object.freeze({ filter: 'lowpass', frequency: 4200, gain: 0.92, pan: 0, q: 0.45 }),
+});
+
+const AUDIBLE_GAIN = 0.92;
+const SILENT_GAIN = 0.0001;
+
+export function getMixLevels(season, view) {
+  if (view === 'interior' || view === 'indoor') return MIX_LEVELS.indoor;
+  return MIX_LEVELS[season] ?? MIX_LEVELS.autumn;
+}
+
+function createAudioWorker() {
+  if (typeof Worker === 'undefined') return null;
+  return new Worker(new URL('./audio-worker.js', import.meta.url), { type: 'module' });
+}
+
+function waitForTask() {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
 export class AmbientSoundscape {
-  constructor() {
+  constructor({
+    createWorker = createAudioWorker,
+    synthesizePcm = null,
+    yieldTask = waitForTask,
+    setTimeoutFn = globalThis.setTimeout.bind(globalThis),
+    clearTimeoutFn = globalThis.clearTimeout.bind(globalThis),
+  } = {}) {
     this.context = null;
     this.master = null;
     this.enabled = false;
     this.started = false;
+    this.disposed = false;
+    this.visible = true;
     this.season = 'autumn';
     this.view = 'outdoor';
     this.gains = null;
+    this.musicGain = null;
     this.pausedByTour = false;
+    this.initializePromise = null;
+    this.suspendTimer = null;
+    this.suspendPromise = null;
+    this.worker = null;
+    this.sources = [];
+    this.nodes = [];
+    this.createWorker = createWorker;
+    this.synthesizePcm = synthesizePcm;
+    this.yieldTask = yieldTask;
+    this.setTimeoutFn = setTimeoutFn;
+    this.clearTimeoutFn = clearTimeoutFn;
+    this.lifecycle = new AbortController();
   }
 
-  createNoiseBuffer(seconds = 6) {
+  createLoopSource(buffer, name) {
     const { context } = this;
-    const frameCount = Math.floor(context.sampleRate * seconds);
-    const buffer = context.createBuffer(2, frameCount, context.sampleRate);
-    for (let channel = 0; channel < 2; channel += 1) {
-      const data = buffer.getChannelData(channel);
-      let brown = 0;
-      for (let index = 0; index < frameCount; index += 1) {
-        const white = Math.random() * 2 - 1;
-        brown = (brown + white * 0.02) * 0.998;
-        data[index] = brown * 1.8 + white * 0.08;
-      }
-    }
-    return buffer;
-  }
-
-  createCrackleBuffer(seconds = 7) {
-    const { context } = this;
-    const frameCount = Math.floor(context.sampleRate * seconds);
-    const buffer = context.createBuffer(2, frameCount, context.sampleRate);
-    for (let channel = 0; channel < 2; channel += 1) {
-      const data = buffer.getChannelData(channel);
-      for (let event = 0; event < 30; event += 1) {
-        const start = Math.floor(Math.random() * (frameCount - 2400));
-        const length = Math.floor(80 + Math.random() * 1500);
-        const amplitude = Math.random() * 0.36 + 0.04;
-        for (let index = 0; index < length; index += 1) {
-          const decay = Math.exp((-index / length) * 7);
-          data[start + index] += (Math.random() * 2 - 1) * decay * amplitude;
-        }
-      }
-    }
-    return buffer;
-  }
-
-  createCricketBuffer(seconds = 8) {
-    const { context } = this;
-    const frameCount = Math.floor(context.sampleRate * seconds);
-    const buffer = context.createBuffer(2, frameCount, context.sampleRate);
-    for (let channel = 0; channel < 2; channel += 1) {
-      const data = buffer.getChannelData(channel);
-      const baseFrequency = channel === 0 ? 3850 : 4260;
-      const period = channel === 0 ? 1.26 : 1.61;
-      for (let startTime = 0.18; startTime < seconds - 0.3; startTime += period) {
-        for (let chirp = 0; chirp < 4; chirp += 1) {
-          const pulseStart = Math.floor((startTime + chirp * 0.055) * context.sampleRate);
-          const pulseLength = Math.floor(0.028 * context.sampleRate);
-          for (let index = 0; index < pulseLength; index += 1) {
-            const envelope = Math.sin((index / pulseLength) * Math.PI);
-            data[pulseStart + index] += Math.sin((index / context.sampleRate) * Math.PI * 2 * baseFrequency) * envelope * 0.032;
-          }
-        }
-      }
-    }
-    return buffer;
-  }
-
-  createFrogBuffer(seconds = 9) {
-    const { context } = this;
-    const frameCount = Math.floor(context.sampleRate * seconds);
-    const buffer = context.createBuffer(2, frameCount, context.sampleRate);
-    for (let channel = 0; channel < 2; channel += 1) {
-      const data = buffer.getChannelData(channel);
-      const periods = channel === 0 ? 1.65 : 2.45;
-      const baseFrequency = channel === 0 ? 132 : 108;
-      for (let call = 0.3; call < seconds - 1; call += periods) {
-        for (let pulse = 0; pulse < 3; pulse += 1) {
-          const start = Math.floor((call + pulse * 0.16) * context.sampleRate);
-          const length = Math.floor(0.11 * context.sampleRate);
-          for (let index = 0; index < length; index += 1) {
-            const t = index / context.sampleRate;
-            const envelope = Math.sin((index / length) * Math.PI);
-            const vibrato = 1 + Math.sin(t * 42) * 0.06;
-            data[start + index] += Math.sin(t * Math.PI * 2 * baseFrequency * vibrato) * envelope * 0.12;
-          }
-        }
-      }
-    }
-    return buffer;
-  }
-
-  createCicadaBuffer(seconds = 10) {
-    const { context } = this;
-    const frameCount = Math.floor(context.sampleRate * seconds);
-    const buffer = context.createBuffer(2, frameCount, context.sampleRate);
-    for (let channel = 0; channel < 2; channel += 1) {
-      const data = buffer.getChannelData(channel);
-      const random = mulberry32(9317 + channel * 41);
-      const baseFrequency = channel === 0 ? 4860 : 5480;
-      const pulseRate = channel === 0 ? 63 : 77;
-      const frequency = Math.round(baseFrequency * seconds) / seconds;
-      const tremoloRate = Math.round(pulseRate * seconds) / seconds;
-      for (let index = 0; index < frameCount; index += 1) {
-        const time = index / context.sampleRate;
-        const slowSwell = 0.58 + Math.sin(Math.PI * 2 * (0.17 + channel * 0.03) * time) * 0.24;
-        const tremolo = 0.36 + Math.sin(Math.PI * 2 * tremoloRate * time + channel) * 0.42;
-        const wingNoise = (random() * 2 - 1) * 0.009;
-        data[index] = (Math.sin(Math.PI * 2 * frequency * time) * 0.046 + wingNoise) * tremolo * slowSwell;
-      }
-    }
-    return buffer;
-  }
-
-  createBirdBuffer(seconds = 9) {
-    const { context } = this;
-    const frameCount = Math.floor(context.sampleRate * seconds);
-    const buffer = context.createBuffer(2, frameCount, context.sampleRate);
-    for (let channel = 0; channel < 2; channel += 1) {
-      const data = buffer.getChannelData(channel);
-      const randomChirps = channel === 0 ? 14 : 10;
-      for (let chirp = 0; chirp < randomChirps; chirp += 1) {
-        const startTime = 0.2 + Math.random() * (seconds - 0.8);
-        const length = Math.floor((0.055 + Math.random() * 0.09) * context.sampleRate);
-        const startFrequency = 2200 + Math.random() * 900;
-        const endFrequency = startFrequency + 500 + Math.random() * 900;
-        const start = Math.floor(startTime * context.sampleRate);
-        for (let index = 0; index < length; index += 1) {
-          const progress = index / length;
-          const envelope = Math.sin(progress * Math.PI);
-          const frequency = startFrequency + (endFrequency - startFrequency) * progress;
-          data[start + index] += Math.sin((index / context.sampleRate) * Math.PI * 2 * frequency) * envelope * 0.035;
-        }
-      }
-    }
-    return buffer;
-  }
-
-
-  createMusicBuffer(seconds = 34) {
-    const { context } = this;
-    const frameCount = Math.floor(context.sampleRate * seconds);
-    const buffer = context.createBuffer(2, frameCount, context.sampleRate);
-    const chords = [
-      [146.83, 220.0, 293.66, 369.99],
-      [123.47, 185.0, 246.94, 369.99],
-      [98.0, 146.83, 196.0, 246.94],
-      [110.0, 164.81, 220.0, 277.18],
-    ];
-    const chordLength = seconds / chords.length;
-    const melody = [587.33, 739.99, 880.0, 659.25, 554.37, 739.99, 493.88, 659.25];
-    const random = mulberry32(84721);
-    for (let channel = 0; channel < 2; channel += 1) {
-      const data = buffer.getChannelData(channel);
-      for (let index = 0; index < frameCount; index += 1) {
-        const time = index / context.sampleRate;
-        const chordIndex = Math.min(chords.length - 1, Math.floor(time / chordLength));
-        const chord = chords[chordIndex];
-        const localTime = time - chordIndex * chordLength;
-        const attack = Math.min(1, localTime / 1.8);
-        const release = Math.min(1, (chordLength - localTime) / 2.4);
-        const envelope = Math.max(0, Math.min(attack, release));
-        let sample = 0;
-        chord.forEach((frequency, noteIndex) => {
-          const detune = channel === 0 ? 0.997 : 1.003;
-          sample += Math.sin(Math.PI * 2 * frequency * detune * time + noteIndex * 0.35) * 0.022;
-          sample += Math.sin(Math.PI * 2 * frequency * 2 * detune * time + noteIndex * 0.18) * 0.0045;
-        });
-        sample *= envelope;
-        const shimmer = Math.sin(Math.PI * 2 * 0.085 * time + channel * 0.8) * 0.0045;
-        data[index] = sample + shimmer * envelope;
-      }
-
-      for (let event = 0; event < 10; event += 1) {
-        const startTime = 1.2 + event * 3.2 + (channel === 0 ? 0 : 1.4) + random() * 0.5;
-        const frequency = melody[Math.floor(random() * melody.length)] * (channel === 0 ? 1 : 1.002);
-        const duration = 1.8;
-        const start = Math.floor(startTime * context.sampleRate);
-        const length = Math.floor(duration * context.sampleRate);
-        for (let index = 0; index < length && start + index < frameCount; index += 1) {
-          const t = index / context.sampleRate;
-          const envelope = Math.exp(-t * 2.4) * Math.min(1, index / 300);
-          data[start + index] += Math.sin(Math.PI * 2 * frequency * t) * envelope * 0.03;
-          data[start + index] += Math.sin(Math.PI * 2 * frequency * 1.5 * t) * envelope * 0.007;
-        }
-      }
-    }
-    return buffer;
-  }
-
-  createLoopSource(buffer, filterType, frequency, gainValue, panValue, q = 1) {
-    const { context } = this;
+    const settings = TRACK_SETTINGS[name];
     const source = context.createBufferSource();
     source.buffer = buffer;
     source.loop = true;
+
     const filter = context.createBiquadFilter();
-    filter.type = filterType;
-    filter.frequency.value = frequency;
-    filter.Q.value = q;
+    filter.type = settings.filter;
+    filter.frequency.value = settings.frequency;
+    filter.Q.value = settings.q;
+
     const gain = context.createGain();
-    gain.gain.value = gainValue;
+    gain.gain.value = settings.gain;
+
     const pan = context.createStereoPanner();
-    pan.pan.value = panValue;
+    pan.pan.value = settings.pan;
+
     source.connect(filter).connect(gain).connect(pan).connect(this.master);
     source.start();
-    return { source, gain, filter };
+
+    this.sources.push(source);
+    this.nodes.push(filter, gain, pan);
+    return { source, filter, gain, pan };
+  }
+
+  createAudioBuffer(track, sampleRate) {
+    const channelCount = track.channels.length;
+    const frameCount = track.channels[0]?.length ?? 0;
+    if (!channelCount || !frameCount) throw new Error('合成音频数据为空');
+    const buffer = this.context.createBuffer(channelCount, frameCount, sampleRate);
+    for (let channel = 0; channel < channelCount; channel += 1) {
+      buffer.getChannelData(channel).set(track.channels[channel]);
+    }
+    return buffer;
+  }
+
+  async synthesizeInWorker(sampleRate, signal, worker = this.createWorker?.()) {
+    if (!worker) throw new Error('当前环境不支持音频 Worker');
+
+    return new Promise((resolve, reject) => {
+      this.worker = worker;
+      let settled = false;
+      const cleanup = () => {
+        worker.removeEventListener?.('message', handleMessage);
+        worker.removeEventListener?.('error', handleError);
+        signal?.removeEventListener('abort', handleAbort);
+        worker.terminate?.();
+        if (this.worker === worker) this.worker = null;
+      };
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        callback(value);
+      };
+      const handleMessage = ({ data }) => {
+        if (data?.type === 'complete') {
+          finish(resolve, data);
+        } else if (data?.type === 'error') {
+          finish(reject, new Error(data.message || '音频 Worker 合成失败'));
+        }
+      };
+      const handleError = event => {
+        finish(reject, event?.error ?? new Error(event?.message || '音频 Worker 运行失败'));
+      };
+      const handleAbort = () => {
+        const error = new Error('音频合成已取消');
+        error.name = 'AbortError';
+        finish(reject, error);
+      };
+
+      worker.addEventListener?.('message', handleMessage);
+      worker.addEventListener?.('error', handleError);
+      signal?.addEventListener('abort', handleAbort, { once: true });
+      if (signal?.aborted) {
+        handleAbort();
+        return;
+      }
+
+      try {
+        worker.postMessage({ type: 'synthesize', sampleRate });
+      } catch (error) {
+        finish(reject, error);
+      }
+    });
+  }
+
+  async synthesizeWithFallback(sampleRate, signal) {
+    if (this.synthesizePcm) return this.synthesizePcm(sampleRate, { signal });
+    const { synthesizePcmChunked } = await import('./audio-synthesis.js');
+    return synthesizePcmChunked(sampleRate, {
+      signal,
+      yieldTask: this.yieldTask,
+    });
+  }
+
+  async synthesizeTracks(sampleRate, signal) {
+    if (!this.createWorker) return this.synthesizeWithFallback(sampleRate, signal);
+
+    let worker;
+    try {
+      worker = this.createWorker();
+    } catch (error) {
+      console.warn('无法创建音频 Worker，改用分片合成：', error);
+      return this.synthesizeWithFallback(sampleRate, signal);
+    }
+    if (!worker) return this.synthesizeWithFallback(sampleRate, signal);
+
+    try {
+      return await this.synthesizeInWorker(sampleRate, signal, worker);
+    } catch (error) {
+      if (error?.name === 'AbortError') throw error;
+      console.warn('音频 Worker 不可用，改用分片合成：', error);
+      return this.synthesizeWithFallback(sampleRate, signal);
+    }
   }
 
   async initialize() {
-    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (this.started) return true;
+    if (this.disposed) throw new Error('音频模块已销毁');
+    if (!this.initializePromise) {
+      this.initializePromise = this.initializeGraph().catch(error => {
+        this.initializePromise = null;
+        throw error;
+      });
+    }
+    const initialized = await this.initializePromise;
+    if (!initialized) this.initializePromise = null;
+    return initialized;
+  }
+
+  async initializeGraph() {
+    if (!this.visible || this.disposed) return false;
+    const AudioContextClass = globalThis.AudioContext || globalThis.webkitAudioContext;
     if (!AudioContextClass) throw new Error('当前浏览器不支持 Web Audio');
-    this.context = new AudioContextClass();
-    const { context } = this;
 
-    this.master = context.createGain();
-    this.master.gain.value = 0;
-    this.master.connect(context.destination);
+    if (!this.context) {
+      const createdContext = new AudioContextClass();
+      this.context = createdContext;
+      this.master = createdContext.createGain();
+      this.master.gain.value = 0;
+      this.master.connect(createdContext.destination);
+    }
 
-    const windSource = context.createBufferSource();
-    windSource.buffer = this.createNoiseBuffer(7);
-    windSource.loop = true;
-    const windFilter = context.createBiquadFilter();
-    windFilter.type = 'lowpass';
-    windFilter.frequency.value = 450;
-    windFilter.Q.value = 0.5;
-    const windGain = context.createGain();
-    windGain.gain.value = 0.34;
-    const windPan = context.createStereoPanner();
-    windPan.pan.value = -0.12;
-    windSource.connect(windFilter).connect(windGain).connect(windPan).connect(this.master);
-    windSource.start();
-    const windLfo = context.createOscillator();
-    windLfo.type = 'sine';
-    windLfo.frequency.value = 0.06;
-    const windLfoAmount = context.createGain();
-    windLfoAmount.gain.value = 130;
-    windLfo.connect(windLfoAmount).connect(windFilter.frequency);
-    windLfo.start();
+    const context = this.context;
+    if (context.state !== 'running') {
+      const resumed = await this.resumeContext();
+      if (!resumed || this.disposed) return false;
+    }
 
-    const gust = this.createLoopSource(this.createNoiseBuffer(5.5), 'bandpass', 780, 0.08, 0.34, 0.55);
-    const crackle = this.createLoopSource(this.createCrackleBuffer(9), 'highpass', 720, 0.34, 0.28);
-    const cricket = this.createLoopSource(this.createCricketBuffer(11), 'bandpass', 4050, 0.18, -0.35, 2.2);
-    const cicada = this.createLoopSource(this.createCicadaBuffer(10), 'bandpass', 5000, 0.2, 0.42, 1.25);
-    const frog = this.createLoopSource(this.createFrogBuffer(10), 'lowpass', 330, 0.26, -0.18, 0.6);
-    const bird = this.createLoopSource(this.createBirdBuffer(10), 'bandpass', 2850, 0.16, 0.28, 1.2);
-    const music = this.createLoopSource(this.createMusicBuffer(34), 'lowpass', 4200, 0.92, 0, 0.45);
+    try {
+      const synthesisRate = Math.min(context.sampleRate, 32000);
+      const pcm = await this.synthesizeTracks(synthesisRate, this.lifecycle.signal);
+      if (this.disposed) throw new Error('音频模块已销毁');
 
-    this.sources = [windSource, gust.source, crackle.source, cricket.source, cicada.source, frog.source, bird.source, music.source];
-    this.musicGain = music.gain;
-    this.gains = {
-      wind: windGain,
-      gust: gust.gain,
-      crackle: crackle.gain,
-      cricket: cricket.gain,
-      cicada: cicada.gain,
-      frog: frog.gain,
-      bird: bird.gain,
-    };
-    this.started = true;
-    this.applyMix(true);
+      const buffers = {};
+      for (const name of TRACK_NAMES) {
+        if (!pcm.tracks?.[name]) throw new Error(`缺少音频轨道：${name}`);
+        buffers[name] = this.createAudioBuffer(pcm.tracks[name], pcm.sampleRate ?? context.sampleRate);
+      }
+
+      const nextGains = {};
+      for (const name of TRACK_NAMES) {
+        const loop = this.createLoopSource(buffers[name], name);
+        if (name === 'wind') {
+          const lfo = context.createOscillator();
+          lfo.type = 'sine';
+          lfo.frequency.value = 0.06;
+          const lfoAmount = context.createGain();
+          lfoAmount.gain.value = 130;
+          lfo.connect(lfoAmount).connect(loop.filter.frequency);
+          lfo.start();
+          this.nodes.push(lfo, lfoAmount);
+        }
+        if (name === 'music') this.musicGain = loop.gain;
+        else nextGains[name] = loop.gain;
+      }
+
+      this.gains = nextGains;
+      this.started = true;
+      this.applyMix(true);
+      return true;
+    } catch (error) {
+      this.stopGraph();
+      this.closeContext();
+      throw error;
+    }
   }
 
   applyMix(immediate = false) {
     if (!this.gains || !this.context) return;
-    let mix;
-    if (this.view === 'indoor') {
-      mix = { wind: 0.11, gust: 0.018, crackle: 0.5, cricket: 0.008, cicada: 0, frog: 0, bird: 0 };
-    } else if (this.season === 'spring') {
-      mix = { wind: 0.32, gust: 0.08, crackle: 0.045, cricket: 0.05, cicada: 0.02, frog: 0.02, bird: 0.32 };
-    } else if (this.season === 'summer') {
-      mix = { wind: 0.24, gust: 0.06, crackle: 0.035, cricket: 0.34, cicada: 0.56, frog: 0.62, bird: 0.08 };
-    } else if (this.season === 'winter') {
-      mix = { wind: 0.3, gust: 0.04, crackle: 0.035, cricket: 0, cicada: 0, frog: 0, bird: 0 };
-    } else {
-      mix = { wind: 0.38, gust: 0.11, crackle: 0.045, cricket: 0.18, cicada: 0.08, frog: 0, bird: 0.025 };
-    }
+    const mix = getMixLevels(this.season, this.view);
     const now = this.context.currentTime;
     for (const [key, value] of Object.entries(mix)) {
       const gain = this.gains[key];
+      if (!gain) continue;
       gain.gain.cancelScheduledValues(now);
       if (immediate) {
         gain.gain.setValueAtTime(value, now);
       } else {
-        gain.gain.setValueAtTime(Math.max(0.0001, gain.gain.value), now);
-        gain.gain.exponentialRampToValueAtTime(Math.max(0.0001, value), now + 1.1);
+        gain.gain.setValueAtTime(Math.max(SILENT_GAIN, gain.gain.value), now);
+        gain.gain.exponentialRampToValueAtTime(Math.max(SILENT_GAIN, value), now + 1.1);
       }
     }
   }
@@ -300,34 +287,95 @@ export class AmbientSoundscape {
     this.applyMix(false);
   }
 
-  async enable() {
-    if (!this.started) await this.initialize();
-    if (this.context.state === 'suspended') {
-      const resumeAttempt = this.context.resume().then(() => true).catch(() => false);
-      const timeout = new Promise((resolve) => {
-        window.setTimeout(() => resolve(false), 650);
-      });
-      await Promise.race([resumeAttempt, timeout]);
-    }
-    if (this.context.state !== 'running') {
-      this.enabled = false;
-      return false;
-    }
+  setVisibility(visible) {
+    this.visible = Boolean(visible);
+    if (!this.visible) return this.suspend();
+    if (this.enabled && !this.pausedByTour) return this.resumePlayback();
+    return Promise.resolve(false);
+  }
+
+  clearSuspendTimer() {
+    if (this.suspendTimer === null) return;
+    this.clearTimeoutFn(this.suspendTimer);
+    this.suspendTimer = null;
+  }
+
+  async resumeContext() {
+    if (!this.context || this.context.state === 'closed' || this.disposed) return false;
+    if (this.suspendPromise) await this.suspendPromise;
+    if (!this.context || this.context.state === 'closed' || this.disposed) return false;
+    if (this.context.state === 'running') return true;
+
+    let timeoutId;
+    const resumeAttempt = this.context.resume().then(() => true).catch(() => false);
+    const timeout = new Promise(resolve => {
+      timeoutId = this.setTimeoutFn(() => resolve(false), 650);
+    });
+    const resumed = await Promise.race([resumeAttempt, timeout]);
+    this.clearTimeoutFn(timeoutId);
+    return resumed && this.context.state === 'running';
+  }
+
+  suspend() {
+    if (!this.context || this.context.state !== 'running') return this.suspendPromise ?? Promise.resolve(false);
+    if (this.suspendPromise) return this.suspendPromise;
+    const operation = this.context.suspend().catch(() => {});
+    const pending = operation.finally(() => {
+      if (this.suspendPromise === pending) this.suspendPromise = null;
+    });
+    this.suspendPromise = pending;
+    return pending;
+  }
+
+  async resumePlayback() {
+    const resumed = await this.resumeContext();
+    if (!resumed || !this.enabled || !this.visible || this.pausedByTour || this.disposed) return false;
     const now = this.context.currentTime;
     this.master.gain.cancelScheduledValues(now);
-    this.master.gain.setValueAtTime(Math.max(0.0001, this.master.gain.value), now);
-    this.master.gain.exponentialRampToValueAtTime(0.92, now + 1.35);
-    this.enabled = true;
+    this.master.gain.setValueAtTime(Math.max(SILENT_GAIN, this.master.gain.value), now);
+    this.master.gain.exponentialRampToValueAtTime(AUDIBLE_GAIN, now + 1.35);
     return true;
   }
 
+  async enable() {
+    if (this.disposed) return false;
+    this.enabled = true;
+    this.clearSuspendTimer();
+    try {
+      const initialized = await this.initialize();
+      if (!initialized || !this.enabled || this.disposed) {
+        this.enabled = false;
+        return false;
+      }
+      if (!this.visible || this.pausedByTour) {
+        this.suspend();
+        return true;
+      }
+
+      const resumed = await this.resumePlayback();
+      if (!resumed) this.enabled = false;
+      return resumed;
+    } catch (error) {
+      this.enabled = false;
+      throw error;
+    }
+  }
+
   disable() {
-    if (!this.context || !this.master) return;
+    this.enabled = false;
+    this.clearSuspendTimer();
+    if (this.disposed || !this.context || !this.master) return;
+
     const now = this.context.currentTime;
     this.master.gain.cancelScheduledValues(now);
-    this.master.gain.setValueAtTime(Math.max(0.0001, this.master.gain.value), now);
-    this.master.gain.exponentialRampToValueAtTime(0.0001, now + 0.7);
-    this.enabled = false;
+    this.master.gain.setValueAtTime(Math.max(SILENT_GAIN, this.master.gain.value), now);
+    this.master.gain.exponentialRampToValueAtTime(SILENT_GAIN, now + 0.7);
+    if (this.context.state === 'running') {
+      this.suspendTimer = this.setTimeoutFn(() => {
+        this.suspendTimer = null;
+        if (!this.enabled) this.suspend();
+      }, 760);
+    }
   }
 
   async toggle() {
@@ -339,18 +387,52 @@ export class AmbientSoundscape {
   }
 
   pause() {
-    if (!this.context || !this.enabled) return;
     this.pausedByTour = true;
-    if (this.context.state === 'running') {
-      this.context.suspend().catch(() => {});
-    }
+    return this.suspend();
   }
 
   resume() {
-    if (!this.context || !this.enabled || !this.pausedByTour) return;
     this.pausedByTour = false;
-    if (this.context.state === 'suspended') {
-      this.context.resume().catch(() => {});
+    return this.enabled && this.visible ? this.resumePlayback() : Promise.resolve(false);
+  }
+
+  stopGraph() {
+    for (const source of this.sources) {
+      try { source.stop(); } catch {}
     }
+    for (const source of this.sources) {
+      try { source.disconnect(); } catch {}
+    }
+    for (const node of this.nodes) {
+      try { node.disconnect(); } catch {}
+    }
+    this.sources = [];
+    this.nodes = [];
+    this.gains = null;
+    this.musicGain = null;
+  }
+
+  closeContext() {
+    if (this.context && this.context.state !== 'closed') {
+      this.context.close().catch(() => {});
+    }
+    this.context = null;
+    this.master = null;
+    this.suspendPromise = null;
+  }
+
+  dispose() {
+    if (this.disposed) return;
+    this.disposed = true;
+    this.enabled = false;
+    this.lifecycle.abort();
+    this.clearSuspendTimer();
+    this.worker?.terminate?.();
+    this.worker = null;
+    this.stopGraph();
+    try { this.master?.disconnect(); } catch {}
+    this.started = false;
+    this.initializePromise = null;
+    this.closeContext();
   }
 }

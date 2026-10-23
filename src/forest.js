@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { mulberry32, randomRange, terrainHeight } from './utils.js';
+import { optimizeStaticScene } from './scene-optimization.js';
 
 const UP = new THREE.Vector3(0, 1, 0);
 
@@ -496,7 +497,7 @@ function createBirches(textures) {
 
   group.name = '白桦';
   setSeason('summer');
-  return { group, setSeason };
+  return { group, setSeason, crowns };
 }
 
 function createGrass(textures) {
@@ -1101,8 +1102,16 @@ export function createLandscape(textures) {
   };
   setSeason('summer');
 
+  // 树冠逐个切换可见性；其他实例层的颜色、数量、风场和积雪引用保持原样。
+  const optimizationStats = optimizeStaticScene(group, [
+    terrain.groundMesh, terrain.snowMesh, pines.foliageMesh, pines.snowMesh,
+    deciduous.leafMesh, deciduous.snowMesh, ...birches.crowns,
+    grass.mesh, ferns, moss, shrubs, rocks, wildflowers, fallenLeaves,
+  ]);
+
   return {
     group,
+    optimizationStats,
     setSeason,
     getSeason: () => currentSeason,
     update(elapsed) {
